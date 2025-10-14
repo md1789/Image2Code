@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  createUserWithEmailAndPassword,
   GoogleAuthProvider,
   onAuthStateChanged,
+  signInWithEmailAndPassword,
   signInWithPopup,
   signOut,
   type User,
@@ -16,7 +18,7 @@ type AuthState = {
 };
 
 export function useFirebaseAuth() {
-  const [state, setState] = useState<AuthState>({ user: null, loading: true });
+  const [state, setState] = useState<AuthState>({ user: null, loading: true, error: undefined });
   const provider = useMemo(() => new GoogleAuthProvider(), []);
 
   useEffect(() => {
@@ -34,19 +36,46 @@ export function useFirebaseAuth() {
     return () => unsubscribe();
   }, []);
 
-  const handleSignIn = async () => {
-    if (!auth) return;
-    await signInWithPopup(auth, provider);
-  };
+  const withAuthInstance = useCallback(
+    async <T,>(action: (currentAuth: NonNullable<typeof auth>) => Promise<T>) => {
+      if (!auth) {
+        setState((prev) => ({
+          ...prev,
+          error: new Error("Firebase Auth is not available in this environment."),
+        }));
+        throw new Error("Firebase Auth is not available in this environment.");
+      }
 
-  const handleSignOut = async () => {
-    if (!auth) return;
-    await signOut(auth);
-  };
+      setState((prev) => ({ ...prev, error: undefined }));
+
+      try {
+        return await action(auth);
+      } catch (error) {
+        const normalizedError =
+          error instanceof Error ? error : new Error("An unexpected authentication error occurred.");
+        setState((prev) => ({ ...prev, error: normalizedError }));
+        throw normalizedError;
+      }
+    },
+    []
+  );
+
+  const signInWithGoogle = () =>
+    withAuthInstance((currentAuth) => signInWithPopup(currentAuth, provider));
+
+  const signInWithEmail = (email: string, password: string) =>
+    withAuthInstance((currentAuth) => signInWithEmailAndPassword(currentAuth, email, password));
+
+  const registerWithEmail = (email: string, password: string) =>
+    withAuthInstance((currentAuth) => createUserWithEmailAndPassword(currentAuth, email, password));
+
+  const handleSignOut = () => withAuthInstance((currentAuth) => signOut(currentAuth));
 
   return {
     ...state,
-    signIn: handleSignIn,
+    signInWithGoogle,
+    signInWithEmail,
+    registerWithEmail,
     signOut: handleSignOut,
   };
 }

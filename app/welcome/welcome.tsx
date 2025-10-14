@@ -1,4 +1,7 @@
 import { type FormEvent, type RefObject, useRef, useState } from "react";
+import { Navigate } from "react-router";
+
+import { useAuth } from "../auth/AuthProvider";
 
 type TabKey = "chat" | "preview" | "history";
 
@@ -94,8 +97,26 @@ const historyEntries: HistoryEntry[] = [
 ];
 
 export function Welcome() {
+  const { user, loading, signOut } = useAuth();
+
+  if (loading) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-100">
+        <div className="text-center">
+          <div className="mb-3 animate-spin rounded-full border-4 border-[#2F6BFF] border-t-transparent p-6" />
+          <p className="text-sm text-slate-400">Loading your workspace…</p>
+        </div>
+      </main>
+    );
+  }
+
+  if (!user) {
+    return <Navigate to="/login" replace />;
+  }
+
   const [activeTab, setActiveTab] = useState<TabKey>("chat");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const displayName = user.displayName ?? user.email ?? "Anonymous";
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -134,29 +155,41 @@ export function Welcome() {
               Bring wireframes to life with an agentic workflow.
             </p>
           </div>
-          <nav className="grid grid-cols-3 gap-2 sm:max-w-sm">
-            {navItems.map((item) => {
-              const isActive = item.key === activeTab;
-              return (
-                <button
-                  key={item.key}
-                  type="button"
-                  onClick={() => setActiveTab(item.key)}
-                  aria-pressed={isActive}
-                  className={`rounded-2xl border px-3 py-2 text-left text-sm font-medium transition-all duration-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2F6BFF] ${
-                    isActive
-                      ? "border-[#2F6BFF] bg-slate-900/70 text-[#D6E2FF]"
-                      : "border-slate-800/70 bg-slate-900/50 text-slate-500 hover:border-[#2F6BFF]/40 hover:text-slate-200"
-                  }`}
-                >
-                  <span className="block text-sm font-semibold">{item.label}</span>
-                  <span className="text-xs font-normal text-slate-500">
-                    {item.description}
-                  </span>
-                </button>
-              );
-            })}
-          </nav>
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:gap-6">
+            <nav className="grid grid-cols-3 gap-2 sm:max-w-sm">
+              {navItems.map((item) => {
+                const isActive = item.key === activeTab;
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setActiveTab(item.key)}
+                    aria-pressed={isActive}
+                    className={`rounded-2xl border px-3 py-2 text-left text-sm font-medium transition-all duration-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2F6BFF] ${
+                      isActive
+                        ? "border-[#2F6BFF] bg-slate-900/70 text-[#D6E2FF]"
+                        : "border-slate-800/70 bg-slate-900/50 text-slate-500 hover:border-[#2F6BFF]/40 hover:text-slate-200"
+                    }`}
+                  >
+                    <span className="block text-sm font-semibold">{item.label}</span>
+                    <span className="text-xs font-normal text-slate-500">
+                      {item.description}
+                    </span>
+                  </button>
+                );
+              })}
+            </nav>
+            <div className="flex items-center justify-between gap-3 rounded-2xl border border-slate-800/70 bg-slate-900/60 px-4 py-2 text-sm text-slate-300 sm:w-auto">
+              <span className="truncate">{displayName}</span>
+              <button
+                type="button"
+                onClick={() => void signOut()}
+                className="rounded-lg border border-slate-700 px-3 py-1 text-xs font-medium text-slate-200 transition hover:border-rose-500 hover:text-rose-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-400"
+              >
+                Sign out
+              </button>
+            </div>
+          </div>
         </header>
 
         {renderContent()}
@@ -226,8 +259,6 @@ function ChatPanel({ messages, onSubmit, onAddImageClick, fileInputRef }: ChatPa
               aria-label="Add images"
               className="flex h-10 w-10 items-center justify-center rounded-2xl border border-slate-800 bg-slate-900 text-slate-200 transition hover:border-slate-700 hover:text-white"
             >
-   
-              <span className="sr-only">Add images</span>
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
                 <path d="M10 4a1 1 0 011 1v4h4a1 1 0 110 2h-4v4a1 1 0 11-2 0v-4H5a1 1 0 110-2h4V5a1 1 0 011-1z" />
               </svg>
