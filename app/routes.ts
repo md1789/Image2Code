@@ -6,4 +6,5 @@ export default [
   route("login", "routes/login.tsx"),
   route("register", "routes/register.tsx"),
   route("welcome", "routes/welcome.tsx"),
+  route("api/vlm", "routes/api.vlm.ts"),
 ];
