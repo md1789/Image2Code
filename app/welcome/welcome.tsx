@@ -2,13 +2,25 @@ import {
   type ChangeEvent,
   type FormEvent,
   type RefObject,
+  useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import { Navigate } from "react-router";
 
 import { useAuth } from "../auth/AuthProvider";
+import {
+  clearPromptHistory,
+  deletePromptHistoryEntry,
+  listenToPromptHistory,
+  savePromptHistory,
+  type PromptHistoryPayload,
+  type PromptHistoryRecord,
+  type StoredChatAttachment,
+  type StoredChatMessage,
+} from "../services/userData";
 
 type TabKey = "chat" | "preview" | "history";
 
@@ -25,12 +37,8 @@ type Message = {
   attachments?: ChatAttachment[];
   variant?: "accent" | "subtle";
   timestamp: string;
-};
-
-type PreviewFile = {
-  name: string;
-  kind: "HTML" | "CSS" | "React" | "Asset";
-  status: string;
+  renderAsCode?: boolean;
+  codeLanguage?: string;
 };
 
 type HistoryEntry = {
@@ -39,7 +47,346 @@ type HistoryEntry = {
   summary: string;
   timestamp: string;
   tags: string[];
+  messages: Message[];
+  createdAt: Date;
 };
+
+type RenderedComponentPreview = {
+  id: string;
+  title: string;
+  html: string;
+  createdAt: Date;
+};
+
+type WireframePreview = {
+  id: string;
+  url: string;
+  name: string;
+  size: number;
+};
+
+const HISTORY_TITLE_MAX_LENGTH = 80;
+const HISTORY_SUMMARY_MAX_LENGTH = 140;
+
+const formatHistoryEntryTimestamp = (date: Date) => {
+  if (Number.isNaN(date.getTime())) {
+    return "Unknown time";
+  }
+
+  const timePart = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const targetDay = new Date(date);
+  targetDay.setHours(0, 0, 0, 0);
+
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+
+  if (targetDay.getTime() === today.getTime()) {
+    return `Today · ${timePart}`;
+  }
+  if (targetDay.getTime() === yesterday.getTime()) {
+    return `Yesterday · ${timePart}`;
+  }
+
+  const datePart = date.toLocaleDateString([], { month: "short", day: "numeric" });
+  return `${datePart} · ${timePart}`;
+};
+
+const truncateText = (value: string, limit: number) => {
+  if (!value) {
+    return "";
+  }
+  return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+};
+
+const createHistoryTitle = (prompt: string) => {
+  const normalized = prompt.trim();
+  if (!normalized) {
+    return "Untitled prompt";
+  }
+  return truncateText(normalized, HISTORY_TITLE_MAX_LENGTH);
+};
+
+const createHistorySummary = (assistantMessages: Message[]) => {
+  const primary = assistantMessages[0]?.content ?? "No response recorded.";
+  return truncateText(primary.trim() || "No response recorded.", HISTORY_SUMMARY_MAX_LENGTH);
+};
+
+const deriveHistoryTagsFromFiles = (files: File[]) => {
+  if (!files || files.length === 0) {
+    return ["Prompt"];
+  }
+
+  const tags = new Set<string>();
+
+  if (files.some((file) => file.type.startsWith("image/"))) {
+    tags.add("Images");
+  }
+  if (files.some((file) => !file.type.startsWith("image/"))) {
+    tags.add("Files");
+  }
+
+  if (tags.size === 0) {
+    tags.add("Prompt");
+  }
+
+  return Array.from(tags);
+};
+
+const serializeMessageForHistory = (message: Message): StoredChatMessage => {
+  const serialized: StoredChatMessage = {
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    timestamp: message.timestamp,
+  };
+
+  if (message.variant) {
+    serialized.variant = message.variant;
+  }
+
+  if (message.attachments && message.attachments.length > 0) {
+    const normalizedAttachments: StoredChatAttachment[] = message.attachments.map((attachment) => {
+      const normalized: StoredChatAttachment = {
+        id: attachment.id,
+        name: attachment.name,
+        type: attachment.type,
+      };
+
+      if (typeof attachment.size === "number" && Number.isFinite(attachment.size)) {
+        normalized.size = attachment.size;
+      }
+
+      return normalized;
+    });
+
+    serialized.attachments = normalizedAttachments;
+  }
+
+  if (message.renderAsCode) {
+    serialized.renderAsCode = true;
+  }
+
+  if (message.codeLanguage) {
+    serialized.codeLanguage = message.codeLanguage;
+  }
+
+  return serialized;
+};
+
+const deserializeStoredMessage = (message: StoredChatMessage): Message => ({
+  id: message.id,
+  role: message.role,
+  content: message.content,
+  timestamp: message.timestamp,
+  variant: message.variant,
+  attachments: message.attachments?.map((attachment) => ({
+    id: attachment.id,
+    name: attachment.name,
+    type: attachment.type,
+    size: attachment.size,
+  })),
+  renderAsCode: message.renderAsCode,
+  codeLanguage: message.codeLanguage,
+});
+
+const mapPromptHistoryRecordToEntry = (record: PromptHistoryRecord): HistoryEntry => ({
+  id: record.id,
+  title: record.title,
+  summary: record.summary,
+  timestamp: formatHistoryEntryTimestamp(record.createdAt),
+  tags: record.tags,
+  messages: record.messages.map(deserializeStoredMessage),
+  createdAt: record.createdAt,
+});
+
+type AgentMessageMapOptions = {
+  mode?: "default" | "friendly-code";
+};
+
+const CODE_SNIPPET_PATTERN =
+  /```|<\/?[a-z][^>]*>|class\s+\w+|function\s+\w+|const\s+\w+|import\s+|export\s+/i;
+
+const hasHtmlIndicators = (value: string) =>
+  /<!doctype|<html|<body|<header|<section|<main|<footer|<script|<div|<nav/i.test(value);
+
+const isLikelyCodeSnippet = (value: string) => {
+  if (!value) {
+    return false;
+  }
+  return CODE_SNIPPET_PATTERN.test(value) || hasHtmlIndicators(value);
+};
+
+const KNOWN_FRIENDLY_INTRO =
+  "I'm implementing the plan from your wireframe. Here's the latest code output.";
+
+const stripMarkdownFence = (value: string) => value.replace(/```[a-zA-Z0-9]*\s*/g, "").trim();
+
+const trimAgentPreface = (value: string) => {
+  const lowered = value.toLowerCase();
+  if (lowered.startsWith("generated python snippet:")) {
+    return value.slice(value.indexOf(":") + 1).trim();
+  }
+  if (lowered.startsWith("generated html:")) {
+    return value.slice(value.indexOf(":") + 1).trim();
+  }
+  return value.trim();
+};
+
+const extractCodeContent = (value: string) => {
+  const withoutFence = stripMarkdownFence(value);
+  const trimmed = trimAgentPreface(withoutFence);
+  const docIndex = trimmed.indexOf("<!DOCTYPE");
+  const htmlIndex = trimmed.indexOf("<html");
+  const snippetStart =
+    docIndex !== -1 ? docIndex : htmlIndex !== -1 ? htmlIndex : trimmed.indexOf("<");
+  if (snippetStart !== -1) {
+    return trimmed.slice(snippetStart).trim();
+  }
+  return trimmed;
+};
+
+const detectCodeLanguage = (value: string): string | undefined => {
+  const sample = value.slice(0, 200).toLowerCase();
+  if (sample.includes("<!doctype") || sample.includes("<html")) {
+    return "html";
+  }
+  if (sample.includes("<svg")) {
+    return "svg";
+  }
+  if (sample.includes("class ") || sample.includes("def ") || sample.includes("import ")) {
+    return "python";
+  }
+  return undefined;
+};
+
+const extractThinkingSteps = (agentMessages?: AgentChatMessagePayload[]) => {
+  if (!agentMessages || agentMessages.length === 0) {
+    return [];
+  }
+  return agentMessages
+    .map((message) => message.content.trim())
+    .filter((content) => content.length > 0 && !isLikelyCodeSnippet(content));
+};
+
+const mapAgentPayloadToMessages = (
+  agentMessages?: AgentChatMessagePayload[],
+  options?: AgentMessageMapOptions,
+  timestampOverride?: string,
+): Message[] => {
+  const timestamp = timestampOverride ?? formatTimestamp(new Date());
+
+  if (!agentMessages || agentMessages.length === 0) {
+    return [];
+  }
+
+  if (options?.mode === "friendly-code") {
+    const [, ...rest] = agentMessages;
+    const hasAdditionalResponses = rest.length > 0;
+    const candidateSources = hasAdditionalResponses ? rest : agentMessages;
+    const filteredCodeSources = candidateSources.filter((message) =>
+      isLikelyCodeSnippet(message.content),
+    );
+    const codeSources = filteredCodeSources.length > 0 ? filteredCodeSources : candidateSources;
+    const codeContentCandidates = codeSources
+      .map((message) => extractCodeContent(message.content))
+      .filter((snippet) => snippet.length > 0);
+    const combinedCode = codeContentCandidates.join("\n\n").trim();
+    const codeLanguage = detectCodeLanguage(combinedCode);
+
+    const codeMessage: Message = {
+      id: createMessageId(),
+      role: "assistant",
+      variant: "accent",
+      content:
+        combinedCode.length > 0
+          ? combinedCode
+          : "Image2Code did not return any code for this run. Try refining your prompt and uploading a clearer wireframe.",
+      timestamp,
+      renderAsCode: true,
+      codeLanguage,
+    };
+
+    return [
+      {
+        id: createMessageId(),
+        role: "assistant",
+        variant: "accent",
+        content: KNOWN_FRIENDLY_INTRO,
+        timestamp,
+      },
+      codeMessage,
+    ];
+  }
+
+  return agentMessages.map((message) => ({
+    id: createMessageId(),
+    role: "assistant",
+    variant: message.variant,
+    content: message.content,
+    timestamp,
+  }));
+};
+
+const createInstructionFallbackMessage = (): Message => ({
+  id: createMessageId(),
+  role: "assistant",
+  variant: "accent",
+  content: FALLBACK_INSTRUCTIONS,
+  timestamp: formatTimestamp(new Date()),
+});
+
+const buildPromptHistoryPayload = (
+  userMessage: Message,
+  assistantMessages: Message[],
+  files: File[],
+): PromptHistoryPayload => ({
+  title: createHistoryTitle(userMessage.content),
+  summary: createHistorySummary(assistantMessages),
+  tags: deriveHistoryTagsFromFiles(files),
+  messages: [userMessage, ...assistantMessages].map(serializeMessageForHistory),
+});
+
+const mapEntryToRenderedComponent = (
+  entry: HistoryEntry,
+): RenderedComponentPreview | null => {
+  const codeMessage = entry.messages.find((message) => message.renderAsCode && message.content);
+
+  if (!codeMessage) {
+    return null;
+  }
+
+  return {
+    id: entry.id,
+    title: entry.title,
+    html: codeMessage.content,
+    createdAt: entry.createdAt,
+  };
+};
+
+const releasePreviewUrls = (urls: string[]) => {
+  urls.forEach((url) => URL.revokeObjectURL(url));
+  urls.length = 0;
+};
+
+const buildWireframePreviews = (
+  files: File[],
+  registerUrl: (url: string) => void,
+): WireframePreview[] =>
+  files
+    .filter((file) => file.type.startsWith("image/"))
+    .map((file) => {
+      const url = URL.createObjectURL(file);
+      registerUrl(url);
+      return {
+        id: `${file.name}-${file.lastModified}-${Math.random().toString(16).slice(2)}`,
+        url,
+        name: file.name,
+        size: file.size,
+      };
+    });
 
 type StatusMessage = {
   kind: "success" | "error";
@@ -90,64 +437,20 @@ const navItems: NavItem[] = [
   { key: "history", label: "History", description: "Previous runs" },
 ];
 
-const messages: Message[] = [
-  {
-    id: "1",
-    role: "user",
-    content:
-      "Generate a simple restaurant website with navigation tabs and cards for menu sections.",
-    timestamp: "9:30 AM",
-  },
-  {
-    id: "2",
-    role: "assistant",
-    variant: "accent",
-    content: "Sure! Here's your code:",
-    attachments: [
-      { id: "att-1", name: "index.html", type: "file" },
-      { id: "att-2", name: "styles.css", type: "file" },
-    ],
-    timestamp: "9:31 AM",
-  },
-  {
-    id: "3",
-    role: "assistant",
-    variant: "subtle",
-    content:
-      "Pro tip: ask for different color palettes or suggest layout tweaks to iterate quickly.",
-    timestamp: "9:32 AM",
-  },
-];
+const IMAGE2CODE_ONBOARDING_PROMPT = [
+  "You are Image2Code, an AI assistant that turns uploaded wireframes and natural language prompts into UI code.",
+  "The user just opened the product and needs concise onboarding tips.",
+  "Provide 3-4 short, actionable bullet points that explain how to capture wireframes, add textual prompts, and iterate to refine results.",
+  "Be encouraging, avoid asking questions, and keep the focus on how to interact with Image2Code effectively.",
+].join(" ");
 
-const previewFiles: PreviewFile[] = [
-  { name: "index.html", kind: "HTML", status: "Updated 2 mins ago" },
-  { name: "styles.css", kind: "CSS", status: "Updated 2 mins ago" },
-  { name: "menu-grid.jsx", kind: "React", status: "New file" },
-];
-
-const historyEntries: HistoryEntry[] = [
-  {
-    id: "HX1",
-    title: "Restaurant landing page",
-    summary: "Two column hero layout with dish gallery and reservations CTA.",
-    timestamp: "Today · 9:20 AM",
-    tags: ["HTML", "CSS"],
-  },
-  {
-    id: "HX2",
-    title: "Fitness app dashboard",
-    summary: "Card grid with progress rings and weekly workout breakdown.",
-    timestamp: "Yesterday · 6:12 PM",
-    tags: ["React", "Tailwind"],
-  },
-  {
-    id: "HX3",
-    title: "Travel inspiration board",
-    summary: "Pinterest-style masonry feed for featured destinations.",
-    timestamp: "Apr 2 · 11:47 AM",
-    tags: ["React", "CSS Modules"],
-  },
-];
+const FALLBACK_INSTRUCTIONS = [
+  "Welcome to Image2Code! Here's how to get the best results:",
+  "• Upload one or more wireframe screenshots (PNG/JPG/WebP) so I can study the layout.",
+  "• Describe the behavior, platform, and any edge cases directly in the prompt field.",
+  "• Iterate by tweaking your prompt or swapping in new images—I remember prior context during a run.",
+  "• Use the Preview and History tabs to inspect generated code or revisit prior explorations.",
+].join("\n");
 
 export function Welcome() {
   const { user, loading, signOut } = useAuth();
@@ -168,18 +471,39 @@ export function Welcome() {
   }
 
   const [activeTab, setActiveTab] = useState<TabKey>("chat");
-  const [chatMessages, setChatMessages] = useState<Message[]>(messages);
+  const [chatMessages, setChatMessages] = useState<Message[]>([]);
   const [promptValue, setPromptValue] = useState("");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [isSending, setIsSending] = useState(false);
   const [status, setStatus] = useState<StatusMessage | null>(null);
-  const [historyItems, setHistoryItems] = useState<HistoryEntry[]>(historyEntries);
-  const [selectedPreviewFile, setSelectedPreviewFile] = useState<PreviewFile | null>(
-    previewFiles[0] ?? null,
-  );
+  const [historyItems, setHistoryItems] = useState<HistoryEntry[]>([]);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(true);
+  const [showClearHistoryConfirm, setShowClearHistoryConfirm] = useState(false);
+  const [isClearingHistory, setIsClearingHistory] = useState(false);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [renderedComponents, setRenderedComponents] = useState<RenderedComponentPreview[]>([]);
+  const [isBootstrappingAssistant, setIsBootstrappingAssistant] = useState(true);
+  const [thinkingEntries, setThinkingEntries] = useState<string[]>([]);
+  const [isThinkingExpanded, setIsThinkingExpanded] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const generatedObjectUrlsRef = useRef<string[]>([]);
+  const previewObjectUrlsRef = useRef<string[]>([]);
+  const submittedPreviewUrlsRef = useRef<string[]>([]);
+  const livePreviewRef = useRef<RenderedComponentPreview | null>(null);
+  const [pendingWireframes, setPendingWireframes] = useState<WireframePreview[]>([]);
+  const [submittedWireframes, setSubmittedWireframes] = useState<WireframePreview[]>([]);
+  const onboardingRequestedRef = useRef(false);
   const displayName = user.displayName ?? user.email ?? "Anonymous";
+  const inspirationPreviews =
+    pendingWireframes.length > 0 ? pendingWireframes : submittedWireframes;
+  const showingPendingWireframes = pendingWireframes.length > 0;
+  const persistSubmittedWireframes = useCallback((files: File[]) => {
+    releasePreviewUrls(submittedPreviewUrlsRef.current);
+    const previews = buildWireframePreviews(files, (url) =>
+      submittedPreviewUrlsRef.current.push(url),
+    );
+    setSubmittedWireframes(previews);
+  }, []);
 
   const registerObjectUrls = (urls: string[]) => {
     if (urls.length === 0) {
@@ -195,11 +519,177 @@ export function Welcome() {
     generatedObjectUrlsRef.current = [];
   };
 
+  const requestAssistantIntro = useCallback(async () => {
+    setIsBootstrappingAssistant(true);
+
+    const requestPayload = new FormData();
+    requestPayload.append("prompt", IMAGE2CODE_ONBOARDING_PROMPT);
+    requestPayload.append("skipImageRequirement", "true");
+
+    try {
+      const response = await fetch(VLM_AGENT_ENDPOINT, {
+        method: "POST",
+        body: requestPayload,
+      });
+
+      let agentResponse: AgentRunResponse | null = null;
+      try {
+        agentResponse = (await response.json()) as AgentRunResponse;
+      } catch (parseError) {
+        console.warn("Unable to parse agent response JSON", parseError);
+      }
+
+      if (!response.ok) {
+        const message =
+          agentResponse?.status?.text ?? `Agent request failed with status ${response.status}.`;
+        throw new Error(message);
+      }
+
+      const statusInfo = agentResponse?.status;
+      const isErrorStatus = statusInfo?.kind === "error";
+
+      const assistantMessages = !isErrorStatus
+        ? mapAgentPayloadToMessages(agentResponse?.messages)
+        : [];
+
+      setChatMessages((current) => {
+        if (current.length > 0) {
+          return current;
+        }
+        if (assistantMessages.length > 0) {
+          return assistantMessages;
+        }
+        return [createInstructionFallbackMessage()];
+      });
+
+      if (isErrorStatus) {
+        setStatus({
+          kind: "error",
+          text: statusInfo?.text ?? "Unable to load Image2Code instructions.",
+          detail: statusInfo?.detail,
+        });
+      } else {
+        setStatus((previous) =>
+          previous ?? {
+            kind: "success",
+            text: "Image2Code shared a few tips to get you started.",
+            detail: statusInfo?.detail,
+          },
+        );
+      }
+    } catch (error) {
+      console.error("Failed to fetch onboarding instructions", error);
+      setStatus({
+        kind: "error",
+        text: "Unable to load Image2Code instructions.",
+        detail: error instanceof Error ? error.message : "Unknown onboarding error.",
+      });
+      setChatMessages((current) =>
+        current.length > 0 ? current : [createInstructionFallbackMessage()],
+      );
+    } finally {
+      setIsBootstrappingAssistant(false);
+    }
+  }, []);
+
   useEffect(() => {
     return () => {
       releaseGeneratedObjectUrls();
     };
   }, []);
+
+  useEffect(() => {
+    return () => {
+      releasePreviewUrls(submittedPreviewUrlsRef.current);
+      releasePreviewUrls(previewObjectUrlsRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    releasePreviewUrls(previewObjectUrlsRef.current);
+    const previews = buildWireframePreviews(selectedFiles, (url) =>
+      previewObjectUrlsRef.current.push(url),
+    );
+    setPendingWireframes(previews);
+
+    return () => {
+      releasePreviewUrls(previewObjectUrlsRef.current);
+    };
+  }, [selectedFiles]);
+
+  useEffect(() => {
+    if (onboardingRequestedRef.current) {
+      return;
+    }
+    onboardingRequestedRef.current = true;
+    void requestAssistantIntro();
+  }, [requestAssistantIntro]);
+
+  useEffect(() => {
+    if (!user) {
+      setHistoryItems([]);
+      setIsHistoryLoading(false);
+      return;
+    }
+
+    setIsHistoryLoading(true);
+    let unsubscribe: (() => void) | undefined;
+
+    try {
+      unsubscribe = listenToPromptHistory(
+        user.uid,
+        (records) => {
+          setHistoryItems(records.map(mapPromptHistoryRecordToEntry));
+          setIsHistoryLoading(false);
+        },
+        (error) => {
+          console.error("Failed to load prompt history", error);
+          setIsHistoryLoading(false);
+          setStatus({
+            kind: "error",
+            text: "Unable to load chat history.",
+            detail: error.message,
+          });
+        },
+      );
+    } catch (error) {
+      console.error("Failed to subscribe to prompt history", error);
+      setIsHistoryLoading(false);
+      setStatus({
+        kind: "error",
+        text: "Unable to start chat history listener.",
+        detail: error instanceof Error ? error.message : "Unknown error.",
+      });
+    }
+
+    return () => {
+      unsubscribe?.();
+    };
+  }, [user?.uid]);
+
+  useEffect(() => {
+    setRenderedComponents((previous) => {
+      const derived =
+        historyItems
+          .map(mapEntryToRenderedComponent)
+          .filter((component): component is RenderedComponentPreview => component !== null) ?? [];
+
+      const pending = livePreviewRef.current;
+      if (pending) {
+        const exists = derived.some(
+          (component) =>
+            component.html.trim() === pending.html.trim() ||
+            (component.id === pending.id && component.title === pending.title),
+        );
+        if (!exists) {
+          return [pending, ...derived];
+        }
+        livePreviewRef.current = null;
+      }
+
+      return derived;
+    });
+  }, [historyItems]);
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -245,6 +735,8 @@ export function Welcome() {
       registerObjectUrls(createdUrls);
     }
 
+    persistSubmittedWireframes(selectedFiles);
+
     const messageContent =
       textContent || (attachments.length > 0 ? "Shared design attachments" : "");
 
@@ -285,18 +777,59 @@ export function Welcome() {
         throw new Error(message);
       }
 
-      const timestamp = formatTimestamp(new Date());
-      const assistantMessages: Message[] =
-        agentResponse?.messages?.map((message) => ({
-          id: createMessageId(),
-          role: "assistant",
-          variant: message.variant,
-          content: message.content,
-          timestamp,
-        })) ?? [];
+      const assistantMessages = mapAgentPayloadToMessages(agentResponse?.messages, {
+        mode: "friendly-code",
+      });
+      const thinkingSteps = extractThinkingSteps(agentResponse?.messages);
+      if (thinkingSteps.length > 0) {
+        setThinkingEntries(thinkingSteps);
+        setIsThinkingExpanded(false);
+      } else {
+        setThinkingEntries([]);
+      }
 
       if (assistantMessages.length > 0) {
         setChatMessages((previous) => [...previous, ...assistantMessages]);
+      }
+
+      const codeMessage = assistantMessages.find((message) => message.renderAsCode);
+      if (codeMessage) {
+        const component: RenderedComponentPreview = {
+          id: `live-${codeMessage.id}`,
+          title: createHistoryTitle(userMessage.content),
+          html: codeMessage.content,
+          createdAt: new Date(),
+        };
+        livePreviewRef.current = component;
+        setRenderedComponents((previous) => [component, ...previous]);
+      }
+
+      if (assistantMessages.length > 0 && user) {
+        const payload = buildPromptHistoryPayload(userMessage, assistantMessages, selectedFiles);
+        try {
+          await savePromptHistory(user.uid, createMessageId(), payload);
+        } catch (historyError) {
+          console.error("Failed to save prompt history", historyError);
+          setStatus((previous) => {
+            const detailMessage =
+              historyError instanceof Error ? historyError.message : "Unknown history error.";
+
+            if (previous && previous.kind === "success") {
+              return {
+                ...previous,
+                detail: previous.detail
+                  ? `${previous.detail} History sync failed: ${detailMessage}`
+                  : `History sync failed: ${detailMessage}`,
+              };
+            }
+
+            return {
+              kind: "error",
+              text: "Generated response but failed to sync chat history.",
+              detail: detailMessage,
+            };
+          });
+        }
       }
 
       if (agentResponse?.status) {
@@ -319,6 +852,9 @@ export function Welcome() {
     } catch (error) {
       console.error("Failed to send message to VLM agent", error);
       const detail = error instanceof Error ? error.message : "Unknown error contacting agent.";
+
+      setThinkingEntries([]);
+      setIsThinkingExpanded(false);
 
       setStatus({
         kind: "error",
@@ -386,68 +922,6 @@ export function Welcome() {
     });
   };
 
-  const handleOpenInEditor = () => {
-    const targetFile = selectedPreviewFile ?? previewFiles[0];
-
-    if (!targetFile) {
-      setStatus({
-        kind: "error",
-        text: "No generated file is available to open.",
-      });
-      return;
-    }
-
-    const placeholderContent = [
-      "// Image2Code editor preview",
-      `// File: ${targetFile.name}`,
-      "// This temporary file helps us confirm that the button is wired up.",
-      "",
-      `// Once the agentic workflow is integrated we'll load the real source for ${targetFile.name}.`,
-    ].join("\n");
-
-    const blob = new Blob([placeholderContent], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    window.open(url, "_blank", "noopener,noreferrer");
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-
-    setStatus({
-      kind: "success",
-      text: `Opened a placeholder editor for ${targetFile.name}.`,
-    });
-  };
-
-  const handleExportCode = () => {
-    if (previewFiles.length === 0) {
-      setStatus({
-        kind: "error",
-        text: "There are no generated files to export yet.",
-      });
-      return;
-    }
-
-    const exportSummary = [
-      "Image2Code export (placeholder)",
-      `Generated on ${new Date().toLocaleString()}`,
-      "",
-      ...previewFiles.map((file) => `${file.name} (${file.kind}) - ${file.status}`),
-    ].join("\n");
-
-    const blob = new Blob([exportSummary], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "image2code-export.txt";
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-
-    setStatus({
-      kind: "success",
-      text: "Download started for the generated code summary.",
-    });
-  };
-
   const handleClearHistory = () => {
     if (historyItems.length === 0) {
       setStatus({
@@ -457,44 +931,70 @@ export function Welcome() {
       return;
     }
 
-    setHistoryItems([]);
-    setStatus({
-      kind: "success",
-      text: "Cleared previous runs from history.",
-    });
+    setShowClearHistoryConfirm(true);
   };
 
-  const buildHistoryConversation = (entry: HistoryEntry): Message[] => [
-    {
-      id: createMessageId(),
-      role: "user",
-      content: `Can we revisit "${entry.title}"?`,
-      timestamp: entry.timestamp,
-    },
-    {
-      id: createMessageId(),
-      role: "assistant",
-      variant: "accent",
-      content: `Absolutely. Here's the summary we have on file: ${entry.summary}`,
-      timestamp: formatTimestamp(new Date()),
-      attachments: [
-        {
-          id: createMessageId(),
-          name: "index.html",
-          type: "file",
-        },
-        {
-          id: createMessageId(),
-          name: "styles.css",
-          type: "file",
-        },
-      ],
-    },
-  ];
+  const handleConfirmClearHistory = async () => {
+    if (!user) {
+      setShowClearHistoryConfirm(false);
+      return;
+    }
+
+    setIsClearingHistory(true);
+    try {
+      await clearPromptHistory(user.uid);
+      setStatus({
+        kind: "success",
+        text: "Cleared previous runs from history.",
+      });
+    } catch (error) {
+      console.error("Failed to clear prompt history", error);
+      setStatus({
+        kind: "error",
+        text: "Unable to clear chat history.",
+        detail: error instanceof Error ? error.message : "Unknown error clearing history.",
+      });
+    } finally {
+      setIsClearingHistory(false);
+      setShowClearHistoryConfirm(false);
+    }
+  };
+
+  const handleDeleteHistoryEntry = async (entryId: string) => {
+    if (!user) {
+      return;
+    }
+
+    setPendingDeleteId(entryId);
+    try {
+      await deletePromptHistoryEntry(user.uid, entryId);
+      setStatus({
+        kind: "success",
+        text: "Removed chat from history.",
+      });
+    } catch (error) {
+      console.error("Failed to delete prompt history entry", error);
+      setStatus({
+        kind: "error",
+        text: "Unable to remove chat from history.",
+        detail: error instanceof Error ? error.message : "Unknown error deleting history entry.",
+      });
+    } finally {
+      setPendingDeleteId((current) => (current === entryId ? null : current));
+    }
+  };
 
   const handleViewConversation = (entry: HistoryEntry) => {
+    if (entry.messages.length === 0) {
+      setStatus({
+        kind: "error",
+        text: "This history item does not include any chat messages yet.",
+      });
+      return;
+    }
+
     releaseGeneratedObjectUrls();
-    setChatMessages(buildHistoryConversation(entry));
+    setChatMessages(entry.messages);
     setActiveTab("chat");
     setStatus({
       kind: "success",
@@ -506,20 +1006,18 @@ export function Welcome() {
     switch (activeTab) {
       case "preview":
         return (
-          <PreviewPanel
-            files={previewFiles}
-            selectedFile={selectedPreviewFile}
-            onSelectFile={setSelectedPreviewFile}
-            onOpenInEditor={handleOpenInEditor}
-            onExportCode={handleExportCode}
-          />
+          <PreviewPanel components={renderedComponents} />
         );
       case "history":
         return (
           <HistoryPanel
             entries={historyItems}
+            isLoading={isHistoryLoading}
             onClearHistory={handleClearHistory}
+            isClearingHistory={isClearingHistory}
             onViewConversation={handleViewConversation}
+            onDeleteEntry={handleDeleteHistoryEntry}
+            deletingEntryId={pendingDeleteId}
           />
         );
       case "chat":
@@ -536,6 +1034,9 @@ export function Welcome() {
             onFileChange={handleFileChange}
             selectedFiles={selectedFiles}
             onRemoveAttachment={handleRemoveAttachment}
+            isBootstrappingAssistant={isBootstrappingAssistant}
+            wireframePreviews={inspirationPreviews}
+            hasPendingWireframes={showingPendingWireframes}
           />
         );
     }
@@ -601,7 +1102,30 @@ export function Welcome() {
           </div>
         )}
 
+        {thinkingEntries.length > 0 && (
+          <ThinkingPanel
+            entries={thinkingEntries}
+            isExpanded={isThinkingExpanded}
+            onToggle={() => setIsThinkingExpanded((previous) => !previous)}
+          />
+        )}
+
         {renderContent()}
+        {showClearHistoryConfirm && (
+          <ConfirmDialog
+            title="Clear chat history?"
+            description="This will permanently delete every saved conversation. This action cannot be undone."
+            confirmLabel="Yes, clear history"
+            cancelLabel="No, keep history"
+            onConfirm={handleConfirmClearHistory}
+            onCancel={() => {
+              if (!isClearingHistory) {
+                setShowClearHistoryConfirm(false);
+              }
+            }}
+            isProcessing={isClearingHistory}
+          />
+        )}
       </div>
     </main>
   );
@@ -618,6 +1142,9 @@ type ChatPanelProps = {
   onFileChange: (event: ChangeEvent<HTMLInputElement>) => void;
   selectedFiles: File[];
   onRemoveAttachment: (file: File) => void;
+  isBootstrappingAssistant: boolean;
+  wireframePreviews: WireframePreview[];
+  hasPendingWireframes: boolean;
 };
 
 function ChatPanel({
@@ -631,19 +1158,50 @@ function ChatPanel({
   onFileChange,
   selectedFiles,
   onRemoveAttachment,
+  isBootstrappingAssistant,
+  wireframePreviews,
+  hasPendingWireframes,
 }: ChatPanelProps) {
   return (
     <section className="grid gap-6 lg:grid-cols-[0.6fr_minmax(0,_1fr)]">
       <aside className="hidden flex-col gap-4 rounded-3xl border border-slate-800/70 bg-slate-900/80 p-6 shadow-[0_18px_60px_-40px_rgba(15,23,42,1)] lg:flex">
         <h2 className="text-sm font-semibold text-slate-300">Inspiration</h2>
-        <div className="aspect-video w-full overflow-hidden rounded-2xl border border-slate-800/70 bg-slate-900">
-          <div className="flex h-full w-full items-center justify-center text-sm font-medium text-slate-500">
-            Upload wireframes to preview here
-          </div>
+        <div className="relative aspect-video w-full overflow-hidden rounded-2xl border border-slate-800/70 bg-slate-900/60">
+          {wireframePreviews.length === 0 ? (
+            <div className="flex h-full w-full items-center justify-center text-sm font-medium text-slate-500">
+              Upload wireframes to preview here
+            </div>
+          ) : (
+            <>
+              <img
+                src={wireframePreviews[0]?.url}
+                alt={wireframePreviews[0]?.name}
+                className="h-full w-full object-cover"
+              />
+              <div className="absolute left-3 top-3 rounded-full bg-slate-950/70 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-200">
+                {wireframePreviews[0]?.name}
+              </div>
+            </>
+          )}
         </div>
+        {wireframePreviews.length > 1 && (
+          <div className="grid grid-cols-3 gap-2">
+            {wireframePreviews.slice(1, 4).map((preview) => (
+              <figure
+                key={preview.id}
+                className="aspect-square overflow-hidden rounded-xl border border-slate-800/60 bg-slate-900/60"
+              >
+                <img src={preview.url} alt={preview.name} className="h-full w-full object-cover" />
+              </figure>
+            ))}
+          </div>
+        )}
         <p className="text-sm leading-relaxed text-slate-400">
-          Drop a mobile or desktop mockup. We'll analyze its layout, pick colors, and produce
-          production-ready code snippets for you to tweak or export.
+          {wireframePreviews.length === 0
+            ? "Drop a mobile or desktop mockup. We'll analyze its layout, pick colors, and produce production-ready code snippets for you to tweak or export."
+            : hasPendingWireframes
+              ? "These are queued for the next run. Send your prompt when you're ready."
+              : "Showing the wireframes used for your latest run. Upload more to iterate further."}
         </p>
       </aside>
 
@@ -661,9 +1219,15 @@ function ChatPanel({
         </div>
 
         <ul className="flex flex-1 flex-col gap-5 overflow-y-auto px-6 py-6">
-          {messages.map((message) => (
-            <MessageBubble key={message.id} message={message} />
-          ))}
+          {messages.length === 0 ? (
+            <li className="flex flex-1 items-center justify-center rounded-3xl border border-dashed border-slate-800/70 bg-slate-900/40 px-4 py-8 text-center text-sm text-slate-400">
+              {isBootstrappingAssistant
+                ? "Checking in with Image2Code for quick tips…"
+                : "Upload a wireframe image and describe the UI you need to start the conversation."}
+            </li>
+          ) : (
+            messages.map((message) => <MessageBubble key={message.id} message={message} />)
+          )}
         </ul>
 
         <form
@@ -741,124 +1305,89 @@ function ChatPanel({
 }
 
 type PreviewPanelProps = {
-  files: PreviewFile[];
-  selectedFile: PreviewFile | null;
-  onSelectFile: (file: PreviewFile) => void;
-  onOpenInEditor: () => void;
-  onExportCode: () => void;
+  components: RenderedComponentPreview[];
 };
 
-function PreviewPanel({
-  files,
-  selectedFile,
-  onSelectFile,
-  onOpenInEditor,
-  onExportCode,
-}: PreviewPanelProps) {
-  return (
-    <section className="grid gap-6 lg:grid-cols-[minmax(0,_1.1fr)_minmax(0,_0.9fr)]">
-      <div className="flex flex-col gap-4 rounded-3xl border border-slate-800/70 bg-slate-900/80 p-6 shadow-[0_24px_70px_-50px_rgba(15,23,42,1)]">
-        <header className="flex items-center justify-between">
-          <div>
-            <h2 className="text-sm font-semibold text-slate-300">Live preview</h2>
-            <p className="text-xs text-slate-500">Render of the generated UI layout.</p>
-          </div>
-          <span className="rounded-full border border-[#2F6BFF]/40 bg-slate-900 px-3 py-1 text-xs font-medium text-[#9BBEFF]">
-            synced
-          </span>
-        </header>
-        <div className="flex flex-col gap-3 rounded-2xl border border-slate-800 bg-slate-950 p-5">
-          <div className="h-9 w-full rounded-xl border border-slate-800/80 bg-slate-900/90" />
-          <div className="flex flex-col gap-3 rounded-xl border border-slate-800/80 bg-slate-900/80 p-4">
-            <div className="flex items-center justify-between">
-              <div className="h-3 w-32 rounded-full bg-[#2F6BFF]/60" />
-              <div className="flex gap-2">
-                <div className="h-2 w-12 rounded-full bg-slate-700" />
-                <div className="h-2 w-12 rounded-full bg-slate-700" />
-              </div>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="h-28 rounded-xl border border-slate-800/80 bg-slate-900" />
-              <div className="h-28 rounded-xl border border-slate-800/80 bg-slate-900" />
-            </div>
-            <div className="h-10 rounded-xl border border-slate-800/80 bg-slate-900" />
-          </div>
-          <div className="grid gap-3 sm:grid-cols-3">
-            <div className="h-24 rounded-xl border border-slate-800/80 bg-slate-900" />
-            <div className="h-24 rounded-xl border border-slate-800/80 bg-slate-900" />
-            <div className="h-24 rounded-xl border border-slate-800/80 bg-slate-900" />
-          </div>
-        </div>
-        <p className="text-xs text-slate-500">
-          Update the prompt and re-run the assistant to refresh the layout preview.
+function PreviewPanel({ components }: PreviewPanelProps) {
+  if (components.length === 0) {
+    return (
+      <section className="rounded-3xl border border-slate-800/70 bg-slate-900/80 p-8 text-center text-sm text-slate-400 shadow-[0_24px_70px_-50px_rgba(15,23,42,1)]">
+        <p>No UI components have been generated yet.</p>
+        <p className="mt-2 text-xs text-slate-500">
+          Send a prompt with a wireframe to populate this gallery.
         </p>
-      </div>
+      </section>
+    );
+  }
 
-      <aside className="flex flex-col gap-4 rounded-3xl border border-slate-800/70 bg-slate-900/70 p-6">
-        <h2 className="text-sm font-semibold text-slate-300">Generated files</h2>
-        <ul className="space-y-3">
-          {files.map((file) => {
-            const isSelected = selectedFile?.name === file.name;
-            return (
-              <li key={file.name}>
-                <button
-                  type="button"
-                  onClick={() => onSelectFile(file)}
-                  aria-pressed={isSelected}
-                  className={`flex w-full items-center justify-between rounded-2xl border px-4 py-3 text-left transition ${
-                    isSelected
-                      ? "border-[#2F6BFF] bg-slate-900 text-slate-100"
-                      : "border-slate-800 bg-slate-900 text-slate-300 hover:border-[#2F6BFF]/40 hover:text-white"
-                  }`}
-                >
-                  <div>
-                    <p className="text-sm font-semibold">{file.name}</p>
-                    <p className="text-xs text-slate-500">{file.status}</p>
-                  </div>
-                  <span
-                    className={`rounded-full border px-3 py-1 text-xs font-medium ${
-                      isSelected
-                        ? "border-[#2F6BFF]/60 text-[#9BBEFF]"
-                        : "border-slate-800/70 text-slate-400"
-                    }`}
-                  >
-                    {file.kind}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-        <div className="mt-auto flex flex-col gap-3">
-          <button
-            type="button"
-            onClick={onOpenInEditor}
-            disabled={!selectedFile}
-            className="rounded-2xl border border-slate-800 bg-slate-900 px-4 py-2 text-sm font-semibold text-slate-200 transition hover:border-[#2F6BFF]/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+  return (
+    <section className="space-y-6">
+      <header>
+        <h2 className="text-sm font-semibold text-slate-200">Component gallery</h2>
+        <p className="text-xs text-slate-500">
+          Each card renders the exact HTML returned by Image2Code for previous runs.
+        </p>
+      </header>
+      <div className="grid gap-6 md:grid-cols-2">
+        {components.map((component) => (
+          <article
+            key={component.id}
+            className="flex flex-col gap-4 rounded-3xl border border-slate-800/70 bg-slate-900/75 p-5 shadow-[0_24px_70px_-60px_rgba(15,23,42,1)]"
           >
-            Open in editor
-          </button>
-          <button
-            type="button"
-            onClick={onExportCode}
-            disabled={files.length === 0}
-            className="rounded-2xl bg-[#2F6BFF] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#2A5FE6] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2F6BFF] disabled:cursor-not-allowed disabled:bg-[#2F6BFF]/60"
-          >
-            Export code
-          </button>
-        </div>
-      </aside>
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-semibold text-slate-100">{component.title}</p>
+                <p className="text-xs text-slate-500">
+                  {component.createdAt.toLocaleString(undefined, {
+                    month: "short",
+                    day: "numeric",
+                    hour: "numeric",
+                    minute: "2-digit",
+                  })}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => openComponentInNewTab(component.html)}
+                className="rounded-full border border-slate-700 px-4 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-[#2F6BFF]/50 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2F6BFF]"
+              >
+                Open full view
+              </button>
+            </div>
+            <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-slate-950">
+              <iframe
+                title={`Preview for ${component.title}`}
+                srcDoc={component.html}
+                sandbox="allow-scripts allow-same-origin allow-forms"
+                className="h-[420px] w-full"
+              />
+            </div>
+          </article>
+        ))}
+      </div>
     </section>
   );
 }
 
 type HistoryPanelProps = {
   entries: HistoryEntry[];
+  isLoading: boolean;
   onClearHistory: () => void;
+  isClearingHistory: boolean;
   onViewConversation: (entry: HistoryEntry) => void;
+  onDeleteEntry: (entryId: string) => void;
+  deletingEntryId: string | null;
 };
 
-function HistoryPanel({ entries, onClearHistory, onViewConversation }: HistoryPanelProps) {
+function HistoryPanel({
+  entries,
+  isLoading,
+  onClearHistory,
+  isClearingHistory,
+  onViewConversation,
+  onDeleteEntry,
+  deletingEntryId,
+}: HistoryPanelProps) {
   return (
     <section className="flex flex-col gap-6">
       <header className="flex flex-col gap-2 rounded-3xl border border-slate-800/70 bg-slate-900/80 px-6 py-5 shadow-[0_24px_70px_-50px_rgba(15,23,42,1)] sm:flex-row sm:items-center sm:justify-between">
@@ -871,14 +1400,18 @@ function HistoryPanel({ entries, onClearHistory, onViewConversation }: HistoryPa
         <button
           type="button"
           onClick={onClearHistory}
-          disabled={entries.length === 0}
+          disabled={entries.length === 0 || isClearingHistory || isLoading}
           className="rounded-xl border border-slate-800 bg-slate-900 px-4 py-2 text-sm font-medium text-slate-200 transition hover:border-[#2F6BFF]/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
         >
-          Clear history
+          {isClearingHistory ? "Clearing…" : "Clear history"}
         </button>
       </header>
 
-      {entries.length === 0 ? (
+      {isLoading ? (
+        <div className="rounded-3xl border border-slate-800/70 bg-slate-900/70 px-5 py-6 text-sm text-slate-400">
+          Loading previous runs…
+        </div>
+      ) : entries.length === 0 ? (
         <div className="rounded-3xl border border-slate-800/70 bg-slate-900/70 px-5 py-6 text-sm text-slate-400">
           No previous runs yet. Send a prompt to populate your history.
         </div>
@@ -894,23 +1427,36 @@ function HistoryPanel({ entries, onClearHistory, onViewConversation }: HistoryPa
                 <p className="text-xs text-slate-500">{entry.summary}</p>
                 <p className="text-xs text-slate-600">{entry.timestamp}</p>
               </div>
-              <div className="flex items-center gap-2">
-                {entry.tags.map((tag) => (
-                  <span
-                    key={tag}
-                    className="rounded-full border border-slate-800/70 px-3 py-1 text-[11px] font-medium uppercase tracking-wide text-slate-400"
-                  >
-                    {tag}
-                  </span>
-                ))}
+              {entry.tags.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2">
+                  {entry.tags.map((tag) => (
+                    <span
+                      key={tag}
+                      className="rounded-full border border-slate-800/70 px-3 py-1 text-[11px] font-medium uppercase tracking-wide text-slate-400"
+                    >
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <button
+                  type="button"
+                  onClick={() => onViewConversation(entry)}
+                  disabled={entry.messages.length === 0}
+                  className="rounded-xl border border-slate-800 bg-slate-900 px-4 py-2 text-sm font-medium text-slate-200 transition hover:border-[#2F6BFF]/40 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  View conversation
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onDeleteEntry(entry.id)}
+                  disabled={deletingEntryId === entry.id}
+                  className="rounded-xl border border-slate-800/70 px-4 py-2 text-sm font-medium text-slate-300 transition hover:border-rose-500/40 hover:text-rose-200 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {deletingEntryId === entry.id ? "Removing…" : "Remove"}
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={() => onViewConversation(entry)}
-                className="ml-auto rounded-xl border border-slate-800 bg-slate-900 px-4 py-2 text-sm font-medium text-slate-200 transition hover:border-[#2F6BFF]/40 hover:text-white"
-              >
-                View conversation
-              </button>
             </li>
           ))}
         </ul>
@@ -919,20 +1465,131 @@ function HistoryPanel({ entries, onClearHistory, onViewConversation }: HistoryPa
   );
 }
 
+type ConfirmDialogProps = {
+  title: string;
+  description: string;
+  confirmLabel: string;
+  cancelLabel: string;
+  onConfirm: () => void | Promise<void>;
+  onCancel: () => void;
+  isProcessing?: boolean;
+};
+
+function ConfirmDialog({
+  title,
+  description,
+  confirmLabel,
+  cancelLabel,
+  onConfirm,
+  onCancel,
+  isProcessing = false,
+}: ConfirmDialogProps) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 px-4 py-6">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-dialog-title"
+        className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl"
+      >
+        <h3 id="confirm-dialog-title" className="text-lg font-semibold text-slate-100">
+          {title}
+        </h3>
+        <p className="mt-2 text-sm text-slate-400">{description}</p>
+        <div className="mt-6 flex justify-end gap-3">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={isProcessing}
+            className="rounded-xl border border-slate-700 px-4 py-2 text-sm font-medium text-slate-200 transition hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {cancelLabel}
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={isProcessing}
+            className="rounded-xl bg-rose-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-rose-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-300 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isProcessing ? "Clearing…" : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type ThinkingPanelProps = {
+  entries: string[];
+  isExpanded: boolean;
+  onToggle: () => void;
+};
+
+function ThinkingPanel({ entries, isExpanded, onToggle }: ThinkingPanelProps) {
+  return (
+    <section className="rounded-3xl border border-slate-800/70 bg-slate-900/70 px-5 py-4 text-sm text-slate-300 shadow-[0_18px_60px_-50px_rgba(15,23,42,1)]">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center justify-between text-left font-semibold text-slate-200 transition hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2F6BFF]"
+      >
+        <span>Thinking log</span>
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox="0 0 20 20"
+          fill="currentColor"
+          className={`h-4 w-4 transition-transform ${isExpanded ? "rotate-180" : ""}`}
+        >
+          <path
+            fillRule="evenodd"
+            d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z"
+            clipRule="evenodd"
+          />
+        </svg>
+      </button>
+      {isExpanded && (
+        <ol className="mt-4 space-y-3 text-sm text-slate-400">
+          {entries.map((entry, index) => (
+            <li key={`${entry.slice(0, 20)}-${index}`}>
+              <span className="mr-2 text-xs font-semibold text-slate-500">{index + 1}.</span>
+              <span className="whitespace-pre-line text-slate-300">{entry}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+      {!isExpanded && (
+        <p className="mt-3 text-xs text-slate-500">
+          Toggle to review the agent&apos;s intermediate steps for this run.
+        </p>
+      )}
+    </section>
+  );
+}
+
+function openComponentInNewTab(html: string) {
+  const blob = new Blob([html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+  window.open(url, "_blank", "noopener,noreferrer");
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
 type MessageBubbleProps = {
   message: Message;
 };
 
 function MessageBubble({ message }: MessageBubbleProps) {
   const isUser = message.role === "user";
+  const isCode = message.renderAsCode === true;
   const bubbleBase =
     "max-w-[min(520px,100%)] rounded-3xl px-5 py-4 text-sm leading-relaxed shadow-sm sm:text-base";
 
   const bubbleTone = isUser
     ? "bg-slate-800 text-slate-100 border border-slate-700"
-    : message.variant === "subtle"
-    ? "bg-slate-800/70 text-slate-300 border border-slate-800"
-    : "bg-[#2F6BFF] text-white shadow-[0_20px_40px_-24px_rgba(47,107,255,1)]";
+    : isCode
+      ? "bg-slate-950 text-slate-100 border border-slate-800 px-0 py-0"
+      : message.variant === "subtle"
+        ? "bg-slate-800/70 text-slate-300 border border-slate-800"
+        : "bg-[#2F6BFF] text-white shadow-[0_20px_40px_-24px_rgba(47,107,255,1)]";
 
   const avatarTone = isUser
     ? "bg-slate-800 text-[#7DA6FF]"
@@ -957,39 +1614,136 @@ function MessageBubble({ message }: MessageBubbleProps) {
             {nameLabel} · {message.timestamp}
           </span>
           <div className={`${bubbleBase} ${bubbleTone}`}>
-            <p className="whitespace-pre-wrap">{message.content}</p>
-            {message.attachments && message.attachments.length > 0 && (
-              <ul className="mt-4 flex flex-wrap gap-3 text-sm font-medium">
-                {message.attachments.map((attachment) => (
-                  <li key={attachment.id}>
-                    {attachment.type === "image" && attachment.previewUrl ? (
-                      <figure className="group relative flex h-28 w-32 overflow-hidden rounded-xl border border-slate-800/80 bg-slate-900/60">
-                        <img
-                          src={attachment.previewUrl}
-                          alt={attachment.name}
-                          className="h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]"
-                        />
-                        <figcaption className="absolute bottom-0 w-full bg-slate-950/80 px-2 py-1 text-[11px] font-medium text-slate-200 backdrop-blur">
-                          {attachment.name}
-                        </figcaption>
-                      </figure>
-                    ) : (
-                      <div className="flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 text-[13px] text-slate-200">
-                        <FileGlyph />
-                        <span className="max-w-[140px] truncate" title={attachment.name}>
-                          {attachment.name}
-                        </span>
-                      </div>
-                    )}
-                  </li>
-                ))}
-              </ul>
+            {isCode ? (
+              <CodePreview content={message.content} language={message.codeLanguage} />
+            ) : (
+              <>
+                <p className="whitespace-pre-wrap">{message.content}</p>
+                {message.attachments && message.attachments.length > 0 && (
+                  <ul className="mt-4 flex flex-wrap gap-3 text-sm font-medium">
+                    {message.attachments.map((attachment) => (
+                      <li key={attachment.id}>
+                        {attachment.type === "image" && attachment.previewUrl ? (
+                          <figure className="group relative flex h-28 w-32 overflow-hidden rounded-xl border border-slate-800/80 bg-slate-900/60">
+                            <img
+                              src={attachment.previewUrl}
+                              alt={attachment.name}
+                              className="h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]"
+                            />
+                            <figcaption className="absolute bottom-0 w-full bg-slate-950/80 px-2 py-1 text-[11px] font-medium text-slate-200 backdrop-blur">
+                              {attachment.name}
+                            </figcaption>
+                          </figure>
+                        ) : (
+                          <div className="flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 text-[13px] text-slate-200">
+                            <FileGlyph />
+                            <span className="max-w-[140px] truncate" title={attachment.name}>
+                              {attachment.name}
+                            </span>
+                          </div>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
             )}
           </div>
         </div>
       </div>
     </li>
   );
+}
+
+function CodePreview({ content, language }: { content: string; language?: string }) {
+  const [copied, setCopied] = useState(false);
+  const normalized = content || "// No code available";
+  const lines = normalized.split("\n");
+  const digits = String(lines.length).length;
+  const highlighted = useMemo(
+    () => buildHighlightedMarkup(normalized, language),
+    [normalized, language],
+  );
+
+  const handleCopy = async () => {
+    if (typeof navigator === "undefined" || !navigator.clipboard) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(normalized);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <div className="overflow-hidden rounded-3xl border border-slate-900 bg-slate-950 shadow-[0_25px_60px_-45px_rgba(15,23,42,1)]">
+      <div className="flex items-center justify-between border-b border-slate-800/70 bg-slate-950/80 px-4 py-2 text-xs uppercase tracking-wide text-slate-400">
+        <span>{language ?? "code"}</span>
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="rounded-full border border-slate-700 px-3 py-1 text-[11px] font-semibold text-slate-200 transition hover:border-[#2F6BFF]/50 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2F6BFF]"
+        >
+          {copied ? "Copied!" : "Copy code"}
+        </button>
+      </div>
+      <div className="flex">
+        <pre className="bg-slate-950/70 px-4 py-4 text-xs font-mono leading-6 text-slate-600">
+          {lines.map((_, index) => (
+            <span key={`line-${index}`} className="block text-right tabular-nums">
+              {String(index + 1).padStart(digits, " ")}
+            </span>
+          ))}
+        </pre>
+        <pre className="flex-1 overflow-auto px-4 py-4 text-xs font-mono leading-6 text-slate-100">
+          <code
+            className="block whitespace-pre text-left"
+            dangerouslySetInnerHTML={{ __html: highlighted }}
+          />
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+function buildHighlightedMarkup(value: string, language?: string) {
+  const escaped = escapeCodeHtml(value);
+  if (language === "html") {
+    return highlightHtmlSyntax(escaped);
+  }
+  return escaped;
+}
+
+function escapeCodeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function highlightHtmlSyntax(escaped: string) {
+  let result = escaped.replace(
+    /(&lt;!--[\s\S]*?--&gt;)/g,
+    '<span class="text-slate-500">$1</span>',
+  );
+
+  result = result.replace(
+    /(&lt;\/?)([a-zA-Z0-9:-]+)([^&]*?)(\/?&gt;)/g,
+    (_match, open, tag, attrs, close) => {
+      const highlightedAttrs = attrs.replace(
+        /([a-zA-Z-:]+)=(&quot;[^&]*?&quot;)/g,
+        '<span class="text-amber-200">$1</span>=<span class="text-emerald-200">$2</span>',
+      );
+      return `<span class="text-slate-500">${open}</span><span class="text-sky-300">${tag}</span>${highlightedAttrs}<span class="text-slate-500">${close}</span>`;
+    },
+  );
+
+  return result;
 }
 
 function FileGlyph() {

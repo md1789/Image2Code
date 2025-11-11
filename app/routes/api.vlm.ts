@@ -4,6 +4,14 @@ import { extname, resolve } from "node:path";
 
 import { pythonWorkingDir, runVlmAgent } from "../services/vlmAgent";
 
+const ONBOARDING_TIPS = [
+  "Here are a few quick steps to get the most out of Image2Code:",
+  "• Capture a clear screenshot of your wireframe (mobile or desktop) before uploading.",
+  "• Describe the desired behavior, breakpoints, and components in the prompt field.",
+  "• Iterate by tweaking text instructions or swapping in updated wireframes.",
+  "• Use Preview to inspect generated files and History to revisit past explorations.",
+].join("\n");
+
 type ActionArgs = {
   request: Request;
 };
@@ -30,6 +38,7 @@ export async function action({ request }: ActionArgs) {
   const formData = await request.formData();
   const promptValue = formData.get("prompt");
   const prompt = typeof promptValue === "string" ? promptValue.trim() : "";
+  const skipImageRequirement = formData.get("skipImageRequirement") === "true";
 
   if (!prompt) {
     return Response.json(
@@ -46,7 +55,28 @@ export async function action({ request }: ActionArgs) {
   const fileValues = formData.getAll("images");
   const imageFiles = fileValues.filter((value): value is File => value instanceof File && value.size > 0);
 
-  if (imageFiles.length === 0) {
+  if (imageFiles.length === 0 && skipImageRequirement) {
+    return Response.json(
+      {
+        messages: [
+          {
+            id: randomUUID(),
+            role: "assistant",
+            variant: "accent",
+            content: ONBOARDING_TIPS,
+          },
+        ],
+        status: {
+          kind: "success",
+          text: "Onboarding tips ready.",
+        },
+        usedFallback: true,
+      },
+      { status: 200 },
+    );
+  }
+
+  if (imageFiles.length === 0 && !skipImageRequirement) {
     return Response.json(
       {
         status: {

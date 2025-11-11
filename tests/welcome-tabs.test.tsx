@@ -35,7 +35,9 @@ describe("Welcome tabs", () => {
     expect(screen.getByText(/Chat Canvas/i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /Preview/i }));
-    expect(screen.getByText(/Live preview/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/No UI components have been generated yet\./i),
+    ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /History/i }));
     expect(screen.getByText(/Run history/i)).toBeInTheDocument();
