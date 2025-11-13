@@ -1,8 +1,7 @@
 import type { Config } from "@react-router/dev/config";
 
 export default {
-  // Config options...
-  // Server-side render by default, to enable SPA mode set this to `false`
+  // Re-enable SSR so API routes (/api/*) and actions run on the dev server.
   ssr: true,
   routeDiscovery: {
     mode: "initial",

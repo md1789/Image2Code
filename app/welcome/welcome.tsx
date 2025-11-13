@@ -452,23 +452,10 @@ const FALLBACK_INSTRUCTIONS = [
   "• Use the Preview and History tabs to inspect generated code or revisit prior explorations.",
 ].join("\n");
 
+const AGENT_REQUEST_TIMEOUT_MS = 120_000;
+
 export function Welcome() {
   const { user, loading, signOut } = useAuth();
-
-  if (loading) {
-    return (
-      <main className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-100">
-        <div className="text-center">
-          <div className="mb-3 animate-spin rounded-full border-4 border-[#2F6BFF] border-t-transparent p-6" />
-          <p className="text-sm text-slate-400">Loading your workspace…</p>
-        </div>
-      </main>
-    );
-  }
-
-  if (!user) {
-    return <Navigate to="/login" replace />;
-  }
 
   const [activeTab, setActiveTab] = useState<TabKey>("chat");
   const [chatMessages, setChatMessages] = useState<Message[]>([]);
@@ -493,7 +480,7 @@ export function Welcome() {
   const [pendingWireframes, setPendingWireframes] = useState<WireframePreview[]>([]);
   const [submittedWireframes, setSubmittedWireframes] = useState<WireframePreview[]>([]);
   const onboardingRequestedRef = useRef(false);
-  const displayName = user.displayName ?? user.email ?? "Anonymous";
+  const displayName = user?.displayName ?? user?.email ?? "Anonymous";
   const inspirationPreviews =
     pendingWireframes.length > 0 ? pendingWireframes : submittedWireframes;
   const showingPendingWireframes = pendingWireframes.length > 0;
@@ -712,165 +699,198 @@ export function Welcome() {
       return;
     }
 
-    const createdUrls: string[] = [];
-    const attachments: ChatAttachment[] = selectedFiles.map((file) => {
-      const isImage = file.type.startsWith("image/");
-      let previewUrl: string | undefined;
-
-      if (isImage) {
-        previewUrl = URL.createObjectURL(file);
-        createdUrls.push(previewUrl);
-      }
-
-      return {
-        id: createMessageId(),
-        name: file.name,
-        type: isImage ? "image" : "file",
-        previewUrl,
-        size: file.size,
-      };
-    });
-
-    if (createdUrls.length > 0) {
-      registerObjectUrls(createdUrls);
-    }
-
-    persistSubmittedWireframes(selectedFiles);
-
-    const messageContent =
-      textContent || (attachments.length > 0 ? "Shared design attachments" : "");
-
-    const userMessage: Message = {
-      id: createMessageId(),
-      role: "user",
-      content: messageContent,
-      attachments: attachments.length > 0 ? attachments : undefined,
-      timestamp: formatTimestamp(new Date()),
-    };
-
-    setChatMessages((previous) => [...previous, userMessage]);
     setIsSending(true);
     setStatus(null);
 
-    const requestPayload = new FormData();
-    requestPayload.append("prompt", textContent);
-    selectedFiles.forEach((file) => {
-      requestPayload.append("images", file);
-    });
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const abortTimeoutId =
+      controller && typeof window !== "undefined"
+        ? window.setTimeout(() => controller.abort(), AGENT_REQUEST_TIMEOUT_MS)
+        : null;
+    const clearAbortTimeout = () => {
+      if (abortTimeoutId !== null && typeof window !== "undefined") {
+        window.clearTimeout(abortTimeoutId);
+      }
+    };
 
     try {
-      const response = await fetch(VLM_AGENT_ENDPOINT, {
-        method: "POST",
-        body: requestPayload,
-      });
+      const createdUrls: string[] = [];
+      const attachments: ChatAttachment[] = selectedFiles.map((file) => {
+        const isImage = file.type.startsWith("image/");
+        let previewUrl: string | undefined;
 
-      let agentResponse: AgentRunResponse | null = null;
-      try {
-        agentResponse = (await response.json()) as AgentRunResponse;
-      } catch (parseError) {
-        console.warn("Unable to parse agent response JSON", parseError);
-      }
-
-      if (!response.ok) {
-        const message =
-          agentResponse?.status?.text ?? `Agent request failed with status ${response.status}.`;
-        throw new Error(message);
-      }
-
-      const assistantMessages = mapAgentPayloadToMessages(agentResponse?.messages, {
-        mode: "friendly-code",
-      });
-      const thinkingSteps = extractThinkingSteps(agentResponse?.messages);
-      if (thinkingSteps.length > 0) {
-        setThinkingEntries(thinkingSteps);
-        setIsThinkingExpanded(false);
-      } else {
-        setThinkingEntries([]);
-      }
-
-      if (assistantMessages.length > 0) {
-        setChatMessages((previous) => [...previous, ...assistantMessages]);
-      }
-
-      const codeMessage = assistantMessages.find((message) => message.renderAsCode);
-      if (codeMessage) {
-        const component: RenderedComponentPreview = {
-          id: `live-${codeMessage.id}`,
-          title: createHistoryTitle(userMessage.content),
-          html: codeMessage.content,
-          createdAt: new Date(),
-        };
-        livePreviewRef.current = component;
-        setRenderedComponents((previous) => [component, ...previous]);
-      }
-
-      if (assistantMessages.length > 0 && user) {
-        const payload = buildPromptHistoryPayload(userMessage, assistantMessages, selectedFiles);
-        try {
-          await savePromptHistory(user.uid, createMessageId(), payload);
-        } catch (historyError) {
-          console.error("Failed to save prompt history", historyError);
-          setStatus((previous) => {
-            const detailMessage =
-              historyError instanceof Error ? historyError.message : "Unknown history error.";
-
-            if (previous && previous.kind === "success") {
-              return {
-                ...previous,
-                detail: previous.detail
-                  ? `${previous.detail} History sync failed: ${detailMessage}`
-                  : `History sync failed: ${detailMessage}`,
-              };
-            }
-
-            return {
-              kind: "error",
-              text: "Generated response but failed to sync chat history.",
-              detail: detailMessage,
-            };
-          });
+        if (isImage) {
+          previewUrl = URL.createObjectURL(file);
+          createdUrls.push(previewUrl);
         }
-      }
 
-      if (agentResponse?.status) {
-        const detail =
-          agentResponse.status.detail ??
-          (agentResponse.usedFallback
-            ? "Python agent unavailable. Served fallback response."
-            : undefined);
-        setStatus({
-          kind: agentResponse.status.kind,
-          text: agentResponse.status.text,
-          detail,
-        });
-      } else {
-        setStatus({
-          kind: "success",
-          text: "Agent responded successfully.",
-        });
-      }
-    } catch (error) {
-      console.error("Failed to send message to VLM agent", error);
-      const detail = error instanceof Error ? error.message : "Unknown error contacting agent.";
-
-      setThinkingEntries([]);
-      setIsThinkingExpanded(false);
-
-      setStatus({
-        kind: "error",
-        text: "We had trouble reaching the agent. Please try again shortly.",
-        detail,
+        return {
+          id: createMessageId(),
+          name: file.name,
+          type: isImage ? "image" : "file",
+          previewUrl,
+          size: file.size,
+        };
       });
 
-      const errorMessage: Message = {
+      if (createdUrls.length > 0) {
+        registerObjectUrls(createdUrls);
+      }
+
+      persistSubmittedWireframes(selectedFiles);
+
+      const messageContent =
+        textContent || (attachments.length > 0 ? "Shared design attachments" : "");
+
+      const userMessage: Message = {
         id: createMessageId(),
-        role: "assistant",
-        variant: "subtle",
-        content:
-          "We couldn't reach the agent service. None of your context was lost—try again once the connection is back.",
+        role: "user",
+        content: messageContent,
+        attachments: attachments.length > 0 ? attachments : undefined,
         timestamp: formatTimestamp(new Date()),
       };
-      setChatMessages((previous) => [...previous, errorMessage]);
+
+      setChatMessages((previous) => [...previous, userMessage]);
+
+      const requestPayload = new FormData();
+      requestPayload.append("prompt", textContent);
+      selectedFiles.forEach((file) => {
+        requestPayload.append("images", file);
+      });
+
+      try {
+        const response = await fetch(VLM_AGENT_ENDPOINT, {
+          method: "POST",
+          body: requestPayload,
+          signal: controller?.signal,
+        });
+        clearAbortTimeout();
+
+        let agentResponse: AgentRunResponse | null = null;
+        try {
+          agentResponse = (await response.json()) as AgentRunResponse;
+        } catch (parseError) {
+          console.warn("Unable to parse agent response JSON", parseError);
+        }
+
+        if (!response.ok) {
+          const message =
+            agentResponse?.status?.text ?? `Agent request failed with status ${response.status}.`;
+          throw new Error(message);
+        }
+
+        const assistantMessages = mapAgentPayloadToMessages(agentResponse?.messages, {
+          mode: "friendly-code",
+        });
+        const thinkingSteps = extractThinkingSteps(agentResponse?.messages);
+        if (thinkingSteps.length > 0) {
+          setThinkingEntries(thinkingSteps);
+          setIsThinkingExpanded(false);
+        } else {
+          setThinkingEntries([]);
+        }
+
+        if (assistantMessages.length > 0) {
+          setChatMessages((previous) => [...previous, ...assistantMessages]);
+        }
+
+        const codeMessage = assistantMessages.find((message) => message.renderAsCode);
+        if (codeMessage) {
+          const component: RenderedComponentPreview = {
+            id: `live-${codeMessage.id}`,
+            title: createHistoryTitle(userMessage.content),
+            html: codeMessage.content,
+            createdAt: new Date(),
+          };
+          livePreviewRef.current = component;
+          setRenderedComponents((previous) => [component, ...previous]);
+        }
+
+        if (assistantMessages.length > 0 && user) {
+          const payload = buildPromptHistoryPayload(userMessage, assistantMessages, selectedFiles);
+          try {
+            await savePromptHistory(user.uid, createMessageId(), payload);
+          } catch (historyError) {
+            console.error("Failed to save prompt history", historyError);
+            setStatus((previous) => {
+              const detailMessage =
+                historyError instanceof Error ? historyError.message : "Unknown history error.";
+
+              if (previous && previous.kind === "success") {
+                return {
+                  ...previous,
+                  detail: previous.detail
+                    ? `${previous.detail} History sync failed: ${detailMessage}`
+                    : `History sync failed: ${detailMessage}`,
+                };
+              }
+
+              return {
+                kind: "error",
+                text: "Generated response but failed to sync chat history.",
+                detail: detailMessage,
+              };
+            });
+          }
+        }
+
+        if (agentResponse?.status) {
+          const detail =
+            agentResponse.status.detail ??
+            (agentResponse.usedFallback
+              ? "Python agent unavailable. Served fallback response."
+              : undefined);
+          setStatus({
+            kind: agentResponse.status.kind,
+            text: agentResponse.status.text,
+            detail,
+          });
+        } else {
+          setStatus({
+            kind: "success",
+            text: "Agent responded successfully.",
+          });
+        }
+      } catch (error) {
+        clearAbortTimeout();
+        console.error("Failed to send message to VLM agent", error);
+        const isAbortError = error instanceof DOMException && error.name === "AbortError";
+        const detail = isAbortError
+          ? "The agent request took longer than expected and was cancelled."
+          : error instanceof Error
+            ? error.message
+            : "Unknown error contacting agent.";
+
+        setThinkingEntries([]);
+        setIsThinkingExpanded(false);
+
+        setStatus({
+          kind: "error",
+          text: isAbortError
+            ? "We cancelled this run because the agent timed out."
+            : "We had trouble reaching the agent. Please try again shortly.",
+          detail,
+        });
+
+        const errorMessage: Message = {
+          id: createMessageId(),
+          role: "assistant",
+          variant: "subtle",
+          content:
+            "We couldn't reach the agent service. None of your context was lost—try again once the connection is back.",
+          timestamp: formatTimestamp(new Date()),
+        };
+        setChatMessages((previous) => [...previous, errorMessage]);
+      }
+    } catch (error) {
+      console.error("Failed to prepare agent request payload", error);
+      setThinkingEntries([]);
+      setIsThinkingExpanded(false);
+      setStatus({
+        kind: "error",
+        text: "We couldn't prepare your request.",
+        detail: error instanceof Error ? error.message : "Unknown client-side error.",
+      });
     } finally {
       setPromptValue("");
       setSelectedFiles([]);
@@ -878,6 +898,7 @@ export function Welcome() {
         fileInputRef.current.value = "";
       }
       setIsSending(false);
+      clearAbortTimeout();
     }
   };
 
@@ -1041,6 +1062,21 @@ export function Welcome() {
         );
     }
   };
+
+  if (loading) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-100">
+        <div className="text-center">
+          <div className="mb-3 animate-spin rounded-full border-4 border-[#2F6BFF] border-t-transparent p-6" />
+          <p className="text-sm text-slate-400">Loading your workspace…</p>
+        </div>
+      </main>
+    );
+  }
+
+  if (!user) {
+    return <Navigate to="/login" replace />;
+  }
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100">
