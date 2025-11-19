@@ -65,6 +65,17 @@ type WireframePreview = {
   size: number;
 };
 
+type PexelsImageResult = {
+  id: number;
+  description: string;
+  photographer: string;
+  previewUrl: string;
+  downloadUrl: string;
+  sourceUrl: string;
+  width: number;
+  height: number;
+};
+
 const HISTORY_TITLE_MAX_LENGTH = 80;
 const HISTORY_SUMMARY_MAX_LENGTH = 140;
 
@@ -327,6 +338,16 @@ const mapAgentPayloadToMessages = (
     variant: message.variant,
     content: message.content,
     timestamp,
+    attachments:
+      message.attachments && message.attachments.length > 0
+        ? message.attachments.map((attachment) => ({
+            id: attachment.id ?? createMessageId(),
+            name: attachment.name,
+            type: attachment.type,
+            previewUrl: attachment.previewUrl,
+            size: attachment.size,
+          }))
+        : undefined,
   }));
 };
 
@@ -409,6 +430,7 @@ type AgentChatMessagePayload = {
   role: "assistant";
   variant: "accent" | "subtle";
   content: string;
+  attachments?: ChatAttachment[];
 };
 
 type AgentRunResponse = {
@@ -452,7 +474,7 @@ const FALLBACK_INSTRUCTIONS = [
   "• Use the Preview and History tabs to inspect generated code or revisit prior explorations.",
 ].join("\n");
 
-const AGENT_REQUEST_TIMEOUT_MS = 120_000;
+const AGENT_REQUEST_TIMEOUT_MS = 240_000; 
 
 export function Welcome() {
   const { user, loading, signOut } = useAuth();
@@ -480,6 +502,11 @@ export function Welcome() {
   const [pendingWireframes, setPendingWireframes] = useState<WireframePreview[]>([]);
   const [submittedWireframes, setSubmittedWireframes] = useState<WireframePreview[]>([]);
   const onboardingRequestedRef = useRef(false);
+  const [pexelsQuery, setPexelsQuery] = useState("");
+  const [pexelsResult, setPexelsResult] = useState<PexelsImageResult | null>(null);
+  const [isPexelsSearching, setIsPexelsSearching] = useState(false);
+  const [isPexelsDownloading, setIsPexelsDownloading] = useState(false);
+  const [pexelsError, setPexelsError] = useState<string | null>(null);
   const displayName = user?.displayName ?? user?.email ?? "Anonymous";
   const inspirationPreviews =
     pendingWireframes.length > 0 ? pendingWireframes : submittedWireframes;
@@ -491,6 +518,105 @@ export function Welcome() {
     );
     setSubmittedWireframes(previews);
   }, []);
+
+  const handlePexelsQueryChange = useCallback(
+    (value: string) => {
+      setPexelsQuery(value);
+      if (pexelsError) {
+        setPexelsError(null);
+      }
+    },
+    [pexelsError],
+  );
+
+  const runPexelsSearch = useCallback(async () => {
+    const trimmedQuery = pexelsQuery.trim();
+    if (!trimmedQuery) {
+      setPexelsError("Describe the layout or asset you want to search on Pexels.");
+      setPexelsResult(null);
+      return;
+    }
+
+    setIsPexelsSearching(true);
+    setPexelsError(null);
+
+    try {
+      const response = await fetch("/api/pexels", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ query: trimmedQuery }),
+      });
+
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        const message =
+          (payload && typeof payload.error === "string" && payload.error) ||
+          "Unable to fetch inspiration from Pexels.";
+        throw new Error(message);
+      }
+
+      if (payload?.photo) {
+        setPexelsResult(payload.photo as PexelsImageResult);
+      } else {
+        setPexelsResult(null);
+        setPexelsError("No matches were found for that description.");
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Unexpected error contacting Pexels.";
+      setPexelsResult(null);
+      setPexelsError(message);
+    } finally {
+      setIsPexelsSearching(false);
+    }
+  }, [pexelsQuery]);
+
+  const handlePexelsDownload = useCallback(async () => {
+    if (!pexelsResult) {
+      setPexelsError("Search for an image before downloading.");
+      return;
+    }
+    if (typeof window === "undefined" || typeof document === "undefined") {
+      return;
+    }
+
+    setIsPexelsDownloading(true);
+    setPexelsError(null);
+
+    try {
+      const filenameBase = buildPexelsFilename(pexelsResult.description);
+      const params = new URLSearchParams({
+        imageUrl: pexelsResult.downloadUrl,
+        filename: filenameBase,
+      });
+      const response = await fetch(`/api/pexels?${params.toString()}`);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Unable to download the selected image.");
+      }
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const disposition = response.headers.get("Content-Disposition");
+      const finalName =
+        extractFilenameFromDisposition(disposition) ?? `${filenameBase}.jpg`;
+
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = finalName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(blobUrl);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Unexpected download error.";
+      setPexelsError(message);
+    } finally {
+      setIsPexelsDownloading(false);
+    }
+  }, [pexelsResult]);
 
   const registerObjectUrls = (urls: string[]) => {
     if (urls.length === 0) {
@@ -808,30 +934,32 @@ export function Welcome() {
 
         if (assistantMessages.length > 0 && user) {
           const payload = buildPromptHistoryPayload(userMessage, assistantMessages, selectedFiles);
-          try {
-            await savePromptHistory(user.uid, createMessageId(), payload);
-          } catch (historyError) {
-            console.error("Failed to save prompt history", historyError);
-            setStatus((previous) => {
-              const detailMessage =
-                historyError instanceof Error ? historyError.message : "Unknown history error.";
+          void (async () => {
+            try {
+              await savePromptHistory(user.uid, createMessageId(), payload);
+            } catch (historyError) {
+              console.error("Failed to save prompt history", historyError);
+              setStatus((previous) => {
+                const detailMessage =
+                  historyError instanceof Error ? historyError.message : "Unknown history error.";
 
-              if (previous && previous.kind === "success") {
+                if (previous && previous.kind === "success") {
+                  return {
+                    ...previous,
+                    detail: previous.detail
+                      ? `${previous.detail} History sync failed: ${detailMessage}`
+                      : `History sync failed: ${detailMessage}`,
+                  };
+                }
+
                 return {
-                  ...previous,
-                  detail: previous.detail
-                    ? `${previous.detail} History sync failed: ${detailMessage}`
-                    : `History sync failed: ${detailMessage}`,
+                  kind: "error",
+                  text: "Generated response but failed to sync chat history.",
+                  detail: detailMessage,
                 };
-              }
-
-              return {
-                kind: "error",
-                text: "Generated response but failed to sync chat history.",
-                detail: detailMessage,
-              };
-            });
-          }
+              });
+            }
+          })();
         }
 
         if (agentResponse?.status) {
@@ -1058,6 +1186,14 @@ export function Welcome() {
             isBootstrappingAssistant={isBootstrappingAssistant}
             wireframePreviews={inspirationPreviews}
             hasPendingWireframes={showingPendingWireframes}
+            pexelsQuery={pexelsQuery}
+            onPexelsQueryChange={handlePexelsQueryChange}
+            onPexelsSearch={runPexelsSearch}
+            isPexelsSearching={isPexelsSearching}
+            pexelsResult={pexelsResult}
+            pexelsError={pexelsError}
+            onPexelsDownload={handlePexelsDownload}
+            isPexelsDownloading={isPexelsDownloading}
           />
         );
     }
@@ -1181,6 +1317,14 @@ type ChatPanelProps = {
   isBootstrappingAssistant: boolean;
   wireframePreviews: WireframePreview[];
   hasPendingWireframes: boolean;
+  pexelsQuery: string;
+  onPexelsQueryChange: (value: string) => void;
+  onPexelsSearch: () => void;
+  isPexelsSearching: boolean;
+  pexelsResult: PexelsImageResult | null;
+  pexelsError: string | null;
+  onPexelsDownload: () => void;
+  isPexelsDownloading: boolean;
 };
 
 function ChatPanel({
@@ -1197,49 +1341,29 @@ function ChatPanel({
   isBootstrappingAssistant,
   wireframePreviews,
   hasPendingWireframes,
+  pexelsQuery,
+  onPexelsQueryChange,
+  onPexelsSearch,
+  isPexelsSearching,
+  pexelsResult,
+  pexelsError,
+  onPexelsDownload,
+  isPexelsDownloading,
 }: ChatPanelProps) {
   return (
-    <section className="grid gap-6 lg:grid-cols-[0.6fr_minmax(0,_1fr)]">
-      <aside className="hidden flex-col gap-4 rounded-3xl border border-slate-800/70 bg-slate-900/80 p-6 shadow-[0_18px_60px_-40px_rgba(15,23,42,1)] lg:flex">
-        <h2 className="text-sm font-semibold text-slate-300">Inspiration</h2>
-        <div className="relative aspect-video w-full overflow-hidden rounded-2xl border border-slate-800/70 bg-slate-900/60">
-          {wireframePreviews.length === 0 ? (
-            <div className="flex h-full w-full items-center justify-center text-sm font-medium text-slate-500">
-              Upload wireframes to preview here
-            </div>
-          ) : (
-            <>
-              <img
-                src={wireframePreviews[0]?.url}
-                alt={wireframePreviews[0]?.name}
-                className="h-full w-full object-cover"
-              />
-              <div className="absolute left-3 top-3 rounded-full bg-slate-950/70 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-200">
-                {wireframePreviews[0]?.name}
-              </div>
-            </>
-          )}
-        </div>
-        {wireframePreviews.length > 1 && (
-          <div className="grid grid-cols-3 gap-2">
-            {wireframePreviews.slice(1, 4).map((preview) => (
-              <figure
-                key={preview.id}
-                className="aspect-square overflow-hidden rounded-xl border border-slate-800/60 bg-slate-900/60"
-              >
-                <img src={preview.url} alt={preview.name} className="h-full w-full object-cover" />
-              </figure>
-            ))}
-          </div>
-        )}
-        <p className="text-sm leading-relaxed text-slate-400">
-          {wireframePreviews.length === 0
-            ? "Drop a mobile or desktop mockup. We'll analyze its layout, pick colors, and produce production-ready code snippets for you to tweak or export."
-            : hasPendingWireframes
-              ? "These are queued for the next run. Send your prompt when you're ready."
-              : "Showing the wireframes used for your latest run. Upload more to iterate further."}
-        </p>
-      </aside>
+    <section className="grid gap-6 lg:grid-cols-[0.65fr_minmax(0,_1fr)]">
+      <ImageGenerationPanel
+        query={pexelsQuery}
+        onQueryChange={onPexelsQueryChange}
+        onSearch={onPexelsSearch}
+        isSearching={isPexelsSearching}
+        result={pexelsResult}
+        error={pexelsError}
+        onDownload={onPexelsDownload}
+        isDownloading={isPexelsDownloading}
+        wireframePreviews={wireframePreviews}
+        hasPendingWireframes={hasPendingWireframes}
+      />
 
       <div className="flex min-h-[480px] flex-col rounded-3xl border border-slate-800/70 bg-slate-900/85 shadow-[0_30px_80px_-45px_rgba(15,23,42,1)]">
         <div className="flex items-center justify-between border-b border-slate-800/70 px-6 py-4">
@@ -1338,6 +1462,167 @@ function ChatPanel({
       </div>
     </section>
   );
+}
+
+type ImageGenerationPanelProps = {
+  query: string;
+  onQueryChange: (value: string) => void;
+  onSearch: () => void;
+  isSearching: boolean;
+  result: PexelsImageResult | null;
+  error: string | null;
+  onDownload: () => void;
+  isDownloading: boolean;
+  wireframePreviews: WireframePreview[];
+  hasPendingWireframes: boolean;
+};
+
+function ImageGenerationPanel({
+  query,
+  onQueryChange,
+  onSearch,
+  isSearching,
+  result,
+  error,
+  onDownload,
+  isDownloading,
+  wireframePreviews,
+  hasPendingWireframes,
+}: ImageGenerationPanelProps) {
+  return (
+    <aside className="hidden flex-col gap-5 rounded-3xl border border-slate-800/70 bg-slate-900/80 p-6 shadow-[0_18px_60px_-40px_rgba(15,23,42,1)] lg:flex">
+      <div className="space-y-4">
+        <div>
+          <h2 className="text-sm font-semibold text-slate-300">Image inspiration</h2>
+          <p className="text-xs text-slate-500">Use the Pexels API to grab hero art or UI mood boards.</p>
+        </div>
+        <form
+          className="space-y-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onSearch();
+          }}
+        >
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={query}
+              onChange={(event) => onQueryChange(event.target.value)}
+              placeholder="e.g. neon fintech dashboard"
+              className="flex-1 rounded-xl border border-slate-800/70 bg-slate-950/60 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-[#2F6BFF]/40 focus:outline-none focus:ring-2 focus:ring-[#2F6BFF]/20"
+              disabled={isSearching}
+            />
+            <button
+              type="submit"
+              className="rounded-xl bg-[#2F6BFF] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#1f4dc5] disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={isSearching}
+            >
+              {isSearching ? "Searching…" : "Search"}
+            </button>
+          </div>
+          <p className="text-xs text-slate-500">
+            Describe the vibe of the interface you want. We’ll fetch a matching hero image from Pexels.
+          </p>
+          {error && <p className="text-xs font-medium text-rose-300">{error}</p>}
+        </form>
+
+        {result ? (
+          <div className="space-y-3 rounded-2xl border border-slate-800/60 bg-slate-950/40 p-3">
+            <figure className="relative aspect-video w-full overflow-hidden rounded-xl border border-slate-800/70">
+              <img src={result.previewUrl} alt={result.description} className="h-full w-full object-cover" />
+              <span className="absolute right-3 top-3 rounded-full bg-slate-950/70 px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-200">
+                Pexels
+              </span>
+            </figure>
+            <div className="space-y-1 text-xs text-slate-400">
+              <p className="text-sm font-semibold text-slate-200">{result.description}</p>
+              <p>
+                {result.photographer} · {result.width}×{result.height}
+              </p>
+              <a
+                href={result.sourceUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="text-[#6FA3FF] underline-offset-2 hover:underline"
+              >
+                View on Pexels
+              </a>
+            </div>
+            <button
+              type="button"
+              onClick={onDownload}
+              className="w-full rounded-xl border border-slate-700 px-3 py-2 text-sm font-medium text-slate-100 transition hover:border-[#2F6BFF]/50 hover:text-[#D6E2FF] disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={isDownloading || isSearching}
+            >
+              {isDownloading ? "Preparing download…" : "Download image"}
+            </button>
+          </div>
+        ) : (
+          <div className="rounded-2xl border border-dashed border-slate-800/60 bg-slate-950/30 p-4 text-xs text-slate-500">
+            No image selected yet. Describe a layout, style, or color palette to get instant reference art.
+          </div>
+        )}
+      </div>
+
+      <div className="space-y-3 rounded-2xl border border-slate-800/70 bg-slate-950/30 p-4">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400">Wireframe tray</h3>
+        <div className="relative aspect-video w-full overflow-hidden rounded-xl border border-slate-800/70 bg-slate-900/60">
+          {wireframePreviews.length === 0 ? (
+            <div className="flex h-full w-full items-center justify-center text-xs font-medium text-slate-500">
+              Upload wireframes to preview here
+            </div>
+          ) : (
+            <>
+              <img
+                src={wireframePreviews[0]?.url}
+                alt={wireframePreviews[0]?.name}
+                className="h-full w-full object-cover"
+              />
+              <div className="absolute left-3 top-3 rounded-full bg-slate-950/70 px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-200">
+                {wireframePreviews[0]?.name}
+              </div>
+            </>
+          )}
+        </div>
+        {wireframePreviews.length > 1 && (
+          <div className="grid grid-cols-3 gap-2">
+            {wireframePreviews.slice(1, 4).map((preview) => (
+              <figure
+                key={preview.id}
+                className="aspect-square overflow-hidden rounded-xl border border-slate-800/60 bg-slate-900/60"
+              >
+                <img src={preview.url} alt={preview.name} className="h-full w-full object-cover" />
+              </figure>
+            ))}
+          </div>
+        )}
+        <p className="text-xs leading-relaxed text-slate-400">
+          {wireframePreviews.length === 0
+            ? "Drop a mobile or desktop mockup. We'll analyze layout, colors, and behavior before writing code."
+            : hasPendingWireframes
+              ? "These are queued for your next run. Send your prompt when you're ready."
+              : "Showing wireframes from your latest run. Upload updated images to iterate further."}
+        </p>
+      </div>
+    </aside>
+  );
+}
+
+function buildPexelsFilename(value: string) {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+  return normalized || "pexels-image";
+}
+
+function extractFilenameFromDisposition(header: string | null): string | null {
+  if (!header) {
+    return null;
+  }
+  const match = /filename\*?=(?:UTF-8'')?\"?([^\";]+)/i.exec(header);
+  return match?.[1] ?? null;
 }
 
 type PreviewPanelProps = {

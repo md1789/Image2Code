@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delicious Restaurant Menu Overview</title>
+    <style>
+        body {
+            background-color: #FFFFFF;
+            color: #333333;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            font-size: 16px;
+            line-height: 1.5;
+            margin: 0;
+            padding: 0;
+        }
+        header {
+            background-color: #FFFFFF;
+            padding: 20px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+        }
+        nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            background-image: url('Assets/generated_ee174da3-bba1-4f74-8479-b6fabf631f78.png');
+            width: 150px;
+            height: 50px;
+            background-size: contain;
+            background-repeat: no-repeat;
+        }
+        .nav-items {
+            display: flex;
+            gap: 20px;
+        }
+        .nav-item {
+            padding: 10px 15px;
+            text-decoration: none;
+            color: #333333;
+            position: relative;
+            transition: background-color 0.3s;
+        }
+        .nav-item:hover {
+            background-color: #f0f0f0;
+        }
+        .nav-item.active {
+            background-color: #4CAF50;
+            color: #FFFFFF;
+            border-radius: 20px;
+        }
+        .nav-item.active::after {
+            content: '';
+            position: absolute;
+            width: 100%;
+            height: 2px;
+            background-color: #4CAF50;
+            bottom: -5px;
+            left: 0;
+        }
+        main {
+            max-width: 1200px;
+            margin: 20px auto;
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 30px;
+        }
+        .card {
+            background-color: #F9F9F9;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            text-align: center;
+        }
+        .card-title {
+            font-size: 24px;
+            font-weight: 700;
+            margin: 15px 0;
+        }
+        .card-description {
+            margin-bottom: 15px;
+            font-size: 16px;
+        }
+        .cta-button {
+            background-color: #4CAF50;
+            color: #FFFFFF;
+            border: none;
+            border-radius: 5px;
+            padding: 10px;
+            cursor: pointer;
+            text-align: center;
+            transition: background-color 0.3s;
+        }
+        .cta-button:hover {
+            background-color: #45a049;
+        }
+        footer {
+            text-align: center;
+            padding: 20px;
+            font-size: 14px;
+            color: #333333;
+        }
+        @media (max-width: 768px) {
+            main {
+                grid-template-columns: repeat(2, 1fr);
+                gap: 15px;
+            }
+        }
+        @media (max-width: 576px) {
+            main {
+                grid-template-columns: 1fr;
+                gap: 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <nav>
+            <div class="logo"></div>
+            <div class="nav-items">
+                <a href="#" class="nav-item">Home</a>
+                <a href="#" class="nav-item">Menu</a>
+                <a href="#" class="nav-item">Pre-order</a>
+                <a href="#" class="nav-item active">Reservation</a>
+                <a href="#" class="nav-item">Contact Us</a>
+            </div>
+        </nav>
+    </header>
+    <main>
+        <div class="card">
+            <h2 class="card-title">Starters</h2>
+            <p class="card-description">Treat your tastebuds with our exquisite starters that prepare you for the main course.</p>
+            <button class="cta-button">Explore Menu</button>
+        </div>
+        <div class="card">
+            <h2 class="card-title">Main Course</h2>
+            <p class="card-description">Indulge in our variety of main course options - From traditional fare to fusion dishes.</p>
+            <button class="cta-button">Explore Menu</button>
+        </div>
+        <div class="card">
+            <h2 class="card-title">Desserts</h2>
+            <p class="card-description">Savor our delicious desserts that will leave you craving for more.</p>
+            <button class="cta-button">Explore Menu</button>
+        </div>
+        <div class="card">
+            <h2 class="card-title">Beverages</h2>
+            <p class="card-description">Quench your thirst with our refreshing and unique beverages.</p>
+            <button class="cta-button">Explore Menu</button>
+        </div>
+    </main>
+    <footer>
+        &copy; 2023 Delicious Restaurant. All rights reserved.
+    </footer>
+</body>
+</html>

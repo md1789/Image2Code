@@ -1,0 +1,52 @@
+### UI_SUMMARY
+The page serves as a restaurant menu overview, featuring a navigation bar at the top, followed by a content section displaying four distinct cards for Starters, Main Course, Desserts, and Beverages. Each card provides a brief description and a call-to-action button. The footer contains copyright information.
+
+### COLOR_PALETTE
+- Background: #FFFFFF
+- Surface/Card: #F9F9F9
+- Text: #333333
+- Muted Text: #777777
+- Primary: #4CAF50
+- Secondary/Accent: #FF5722
+- Link: #2196F3
+- Button-default: #4CAF50
+- Button-active: #388E3C
+
+### TYPOGRAPHY
+- Font Family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif
+- Base Font Size: 16px
+- Title Sizes: h1: 32px, h2: 24px, h3: 18px
+- Weight Rules: Regular (400) for body text, Bold (700) for titles
+- Line Heights: 1.5 for body text, 1.2 for titles
+
+### LAYOUT
+- Container Max-Width: 1200px
+- Global Padding: 20px
+- Section Gaps: 30px
+- Structure: Header/nav at the top, followed by a single row of content cards, and a centered footer at the bottom. 
+- Items Side-by-Side: 4 cards appear side-by-side in each row.
+
+### NAVBAR
+- Order of Items: Home, Menu, Pre-order, Reservation (ACTIVE), Contact Us
+- Active Item Styling: Padding: 10px 15px, Radius: 20px, Background: #4CAF50, Text Color: #FFFFFF
+
+### CARDS
+- Card Titles: Starters, Main Course, Desserts, Beverages
+- Body Summary: Brief descriptions of each category.
+- CTA Label: "Explore Menu" (Button style)
+- Card Padding: 20px
+- Radius: 10px
+- Shadow: Subtle shadow effect
+- Spacing: 15px between title/body/cta
+
+### RESPONSIVE_RULES
+- Breakpoints: 
+  - Small (sm): <576px - 1 column stack
+  - Medium (md): 576px to 768px - 2 columns stack
+  - Large (lg): >768px - 4 columns side-by-side
+- Changes: Adjust spacing to 15px between cards at sm and md breakpoints.
+
+### SPACING_AND_BORDERS
+- Margins: 20px for sections
+- Gaps: 30px between cards
+- Radii: 10px for card corners and 20px for active nav item.

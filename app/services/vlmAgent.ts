@@ -4,8 +4,16 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Readable } from "node:stream";
 
-const PYTHON_TIMEOUT_MS = 60_000;
+const PYTHON_TIMEOUT_MS = 180_000;
 const PYTHON_SCRIPT = "run_agent_once.py";
+
+type AgentAttachment = {
+  id: string;
+  name: string;
+  type: "image" | "file";
+  previewUrl?: string;
+  size?: number;
+};
 
 type PythonAgentSuccess = {
   success: true;
@@ -16,6 +24,11 @@ type PythonAgentSuccess = {
     feedback?: string;
     error?: string | null;
     logs?: string;
+    preview_image?: {
+      name?: string;
+      dataUrl: string;
+      size?: number;
+    };
   };
   logs?: string;
 };
@@ -33,6 +46,7 @@ export type AgentChatMessage = {
   role: "assistant";
   variant: "accent" | "subtle";
   content: string;
+  attachments?: AgentAttachment[];
 };
 
 export type AgentRunResult = {
@@ -85,7 +99,10 @@ async function runPythonProcess(prompt: string, imagePath?: string): Promise<Pyt
       resolveResult({ success: false, error: "Python agent timed out." });
     }, PYTHON_TIMEOUT_MS);
 
-    void collectStream(subprocess.stdout).then((stdout) => {
+    const stdoutPromise = collectStream(subprocess.stdout);
+    const stderrPromise = collectStream(subprocess.stderr);
+
+    void Promise.all([stdoutPromise, stderrPromise]).then(([stdout, stderr]) => {
       if (resolved) {
         return;
       }
@@ -95,25 +112,23 @@ async function runPythonProcess(prompt: string, imagePath?: string): Promise<Pyt
 
       try {
         const parsed = JSON.parse(stdout) as PythonAgentResponse;
+        if (stderr) {
+          if (parsed.success) {
+            parsed.result.logs = parsed.result.logs
+              ? `${parsed.result.logs}\n${stderr}`
+              : stderr;
+          } else {
+            parsed.logs = parsed.logs ? `${parsed.logs}\n${stderr}` : stderr;
+          }
+        }
         resolveResult(parsed);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown JSON parse error";
+        const combinedLogs = [stdout, stderr].filter(Boolean).join("\n\n");
         resolveResult({
           success: false,
           error: `Unable to parse python output: ${message}`,
-          logs: stdout,
-        });
-      }
-    });
-
-    void collectStream(subprocess.stderr).then((stderr) => {
-      if (stderr && !resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        resolveResult({
-          success: false,
-          error: "Python agent wrote to stderr.",
-          logs: stderr,
+          logs: combinedLogs || undefined,
         });
       }
     });
@@ -173,6 +188,24 @@ function buildMessagesFromPython(result: PythonAgentSuccess["result"]): AgentCha
       role: "assistant",
       variant: "accent",
       content: `Generated Python snippet:\n${result.code.trim()}`,
+    });
+  }
+
+  if (result.preview_image?.dataUrl) {
+    messages.push({
+      id: randomUUID(),
+      role: "assistant",
+      variant: "accent",
+      content: "Here's the rendered preview.",
+      attachments: [
+        {
+          id: randomUUID(),
+          name: result.preview_image.name ?? "agent-preview.png",
+          type: "image",
+          previewUrl: result.preview_image.dataUrl,
+          size: result.preview_image.size,
+        },
+      ],
     });
   }
 

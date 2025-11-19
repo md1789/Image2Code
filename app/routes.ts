@@ -7,4 +7,5 @@ export default [
   route("register", "routes/register.tsx"),
   route("welcome", "routes/welcome.tsx"),
   route("api/vlm", "routes/api.vlm.ts"),
+  route("api/pexels", "routes/api.pexels.ts"),
 ];
