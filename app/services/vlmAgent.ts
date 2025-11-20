@@ -29,6 +29,8 @@ type PythonAgentSuccess = {
       dataUrl: string;
       size?: number;
     };
+    final_html_path?: string;
+    final_html_web_path?: string | null;
   };
   logs?: string;
 };
@@ -47,6 +49,8 @@ export type AgentChatMessage = {
   variant: "accent" | "subtle";
   content: string;
   attachments?: AgentAttachment[];
+  htmlPath?: string;
+  htmlWebPath?: string | null;
 };
 
 export type AgentRunResult = {
@@ -57,6 +61,8 @@ export type AgentRunResult = {
     detail?: string;
   };
   usedFallback: boolean;
+  finalHtmlPath?: string;
+  finalHtmlWebPath?: string | null;
 };
 
 const serviceDir = fileURLToPath(new URL(".", import.meta.url));
@@ -194,6 +200,8 @@ function buildMessagesFromPython(result: PythonAgentSuccess["result"]): AgentCha
       role: "assistant",
       variant: "accent",
       content: `Generated Python snippet:\n${result.code.trim()}`,
+      htmlPath: result.final_html_path,
+      htmlWebPath: result.final_html_web_path,
     });
   }
 
@@ -327,6 +335,8 @@ export async function runVlmAgent(prompt: string, imagePath?: string): Promise<A
       detail: pythonResult.logs ?? pythonResult.result.logs,
     },
     usedFallback: false,
+    finalHtmlPath: pythonResult.result.final_html_path,
+    finalHtmlWebPath: pythonResult.result.final_html_web_path,
   };
 }
 
