@@ -80,9 +80,15 @@ async function runPythonProcess(prompt: string, imagePath?: string): Promise<Pyt
 
     let subprocess: ChildProcessWithoutNullStreams;
     try {
+      const env = {
+        ...process.env,
+        PYTHONIOENCODING: "utf-8",
+        PYTHONUTF8: "1",
+      };
       subprocess = spawn(pythonExecutable, [pythonScriptPath], {
         cwd: pythonWorkingDir,
         stdio: "pipe",
+        env,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown spawn error";
