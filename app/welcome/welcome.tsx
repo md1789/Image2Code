@@ -359,6 +359,18 @@ const createInstructionFallbackMessage = (): Message => ({
   timestamp: formatTimestamp(new Date()),
 });
 
+const summarizeAgentLog = (log: string, maxItems = 4): string => {
+  const segments = log
+    .split(/(?=Stage|Asset resolved|HTML saved|Best score|Error|->)/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  if (segments.length === 0) {
+    return log.length > 400 ? `${log.slice(0, 400)}…` : log;
+  }
+  const highlights = segments.slice(0, maxItems).map((item) => `• ${item.replace(/\s+/g, " ")}`);
+  return ["Agent summary:", ...highlights].join("\n");
+};
+
 const buildPromptHistoryPayload = (
   userMessage: Message,
   assistantMessages: Message[],
@@ -474,7 +486,7 @@ const FALLBACK_INSTRUCTIONS = [
   "• Use the Preview and History tabs to inspect generated code or revisit prior explorations.",
 ].join("\n");
 
-const AGENT_REQUEST_TIMEOUT_MS = 240_000; 
+const AGENT_REQUEST_TIMEOUT_MS = 3_600_000; // 6 minutes
 
 export function Welcome() {
   const { user, loading, signOut } = useAuth();
@@ -907,6 +919,14 @@ export function Welcome() {
 
         const assistantMessages = mapAgentPayloadToMessages(agentResponse?.messages, {
           mode: "friendly-code",
+        }).map((message) => {
+          if (message.variant === "subtle" && message.content.length > 400) {
+            return {
+              ...message,
+              content: summarizeAgentLog(message.content, 4),
+            };
+          }
+          return message;
         });
         const thinkingSteps = extractThinkingSteps(agentResponse?.messages);
         if (thinkingSteps.length > 0) {
@@ -1459,6 +1479,16 @@ function ChatPanel({
             </button>
           </div>
         </form>
+        {isSending && (
+          <p
+            role="status"
+            aria-live="polite"
+            className="mx-4 mb-4 flex items-center gap-3 rounded-2xl border border-slate-800/60 bg-slate-900/70 px-4 py-3 text-xs font-medium text-slate-300 animate-pulse"
+          >
+            <span className="inline-flex h-2 w-2 animate-ping rounded-full bg-[#2F6BFF]" />
+            Agent is still running. Bigger generations can take a minute—keep this tab open while we finish.
+          </p>
+        )}
       </div>
     </section>
   );
